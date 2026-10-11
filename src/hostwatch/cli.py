@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import signal
+import sys
 
 from . import config, log, messages, netinfo, processes, sessions, slack, state, timefmt
 
@@ -157,6 +158,40 @@ def run_heartbeat_interval(args):
     return 0
 
 
+def run_config_summary(args):
+    """Admin helper for install.sh: the existing config as it may be shown.
+
+    Prints ``key=value`` lines: the masked webhook, the machine name, the
+    heartbeat setting and one ``missing=`` line per setting the file lacks.
+    The full webhook is never printed or logged.
+    """
+    try:
+        path = getattr(args, "config", None) or config.DEFAULT_PATH
+        cfg = config.load(path, require_webhook=False)
+        missing = config.missing_settings(path, args.example)
+    except config.ConfigError as exc:
+        log.error(str(exc))
+        return 1
+    try:
+        enabled, interval = config.heartbeat_settings(cfg)
+        heartbeat = f"enabled, every {interval} min" if enabled else "disabled"
+    except config.ConfigError as exc:
+        heartbeat = f"invalid ({exc})"
+    lines = [
+        f"webhook={config.mask_webhook(cfg.webhook_url)}",
+        f"machine_name={_printable(cfg.machine_name) or 'not set (hostname only)'}",
+        f"heartbeat={heartbeat}",
+    ] + [f"missing=[{section}] {key} (default: {default})" for section, key, default in missing]
+    if hasattr(sys.stdout, "reconfigure"):  # "…" on a non-UTF-8 terminal
+        sys.stdout.reconfigure(errors="backslashreplace")
+    print("\n".join(lines))
+    return 0
+
+
+def _printable(text):
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
 def run_shutdown(args):
     """ExecStop of hostwatch-shutdown.service: announce a real poweroff/reboot."""
     dry_run = getattr(args, "dry_run", False)
@@ -282,12 +317,15 @@ def build_parser():
     sub.add_parser("login", parents=[common], help="send a login notification (pam_exec hook)")
     sub.add_parser("test", parents=[common], help="send a test message; exit 1 if it fails")
     sub.add_parser("heartbeat-interval", parents=[common])  # hidden: used by install.sh
+    summary = sub.add_parser("config-summary", parents=[common])  # hidden: used by install.sh
+    summary.add_argument("--example", required=True)
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     handlers = {"boot": run_boot, "shutdown": run_shutdown, "heartbeat": run_heartbeat,
-                "heartbeat-interval": run_heartbeat_interval, "login": run_login,
+                "heartbeat-interval": run_heartbeat_interval,
+                "config-summary": run_config_summary, "login": run_login,
                 "test": run_test}
     return handlers[args.command](args)

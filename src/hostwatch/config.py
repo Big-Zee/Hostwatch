@@ -45,18 +45,7 @@ def load(path=None, require_webhook=True):
     is accepted; every other setting is still validated.
     """
     path = resolve_path(path)
-    parser = configparser.ConfigParser(interpolation=None)
-    try:
-        # utf-8-sig drops the byte-order mark some Windows editors write.
-        with open(path, encoding="utf-8-sig") as fh:
-            parser.read_file(fh)
-    except OSError as exc:
-        raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from None
-    except UnicodeDecodeError:
-        raise ConfigError(f"config {path} is not valid UTF-8") from None
-    except configparser.Error:
-        # The parser's message can quote the offending line, which may be the webhook.
-        raise ConfigError(f"invalid syntax in config {path}") from None
+    parser = _read(path)
 
     try:
         include_ipv6 = parser.getboolean("boot", "include_ipv6", fallback=False)
@@ -81,6 +70,66 @@ def load(path=None, require_webhook=True):
     )
     validate(cfg, require_webhook)
     return cfg
+
+
+def _read(path):
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        # utf-8-sig drops the byte-order mark some Windows editors write.
+        with open(path, encoding="utf-8-sig") as fh:
+            parser.read_file(fh)
+    except OSError as exc:
+        raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"config {path} is not valid UTF-8") from None
+    except configparser.Error:
+        # The parser's message can quote the offending line, which may be the webhook.
+        raise ConfigError(f"invalid syntax in config {path}") from None
+    return parser
+
+
+def mask_webhook(url):
+    """The webhook as it may be shown: scheme and host, then the last 4 characters.
+
+    Used by install.sh, so the full secret never reaches a terminal or a log.
+    """
+    url = (url or "").strip()
+    if not url or url == PLACEHOLDER_WEBHOOK:
+        return "not set"
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        host = None
+    if host and parts.scheme and len(url) >= 8:
+        return f"{parts.scheme}://{host}/…{url[-4:]}"
+    return f"…{url[-4:]}"
+
+
+# Defaults reported for settings missing from an existing config.
+_DEFAULTS = {
+    ("slack", "webhook_url"): "none, required",
+    ("boot", "skip_interfaces"): ",".join(DEFAULT_SKIP_INTERFACES),
+    ("boot", "include_ipv6"): "false",
+    ("display", "timezone"): "local",
+    ("heartbeat", "enabled"): "true",
+    ("heartbeat", "interval_minutes"): str(DEFAULT_HEARTBEAT_INTERVAL),
+}
+
+
+def missing_settings(path, example_path):
+    """(section, key, default) for each setting in the example that the config lacks.
+
+    Only uncommented example settings count, so optional ones such as
+    machine_name are never reported. The config file itself is not changed.
+    """
+    have, example = _read(path), _read(example_path)
+    return [
+        (section, key, _DEFAULTS.get((section, key), example.get(section, key)))
+        for section in example.sections()
+        for key in example[section]
+        if not have.has_option(section, key)
+    ]
 
 
 def heartbeat_settings(cfg):

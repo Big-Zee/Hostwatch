@@ -637,5 +637,68 @@ class HeartbeatCommandTest(unittest.TestCase):
         self.assertNotIn("heartbeat-interval", helptext)
 
 
+class ConfigSummaryTest(unittest.TestCase):
+    SECRET_HOOK = "https://hooks.slack.com/services/T000/B000/SECRETxyzabcd"
+
+    def config(self, text):
+        fd, path = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def summary(self, path):
+        err = io.StringIO()
+        with mock.patch.object(cli.log, "error") as error, \
+                mock.patch.object(cli.log, "info") as info, contextlib.redirect_stderr(err):
+            code, out = run(["config-summary", "--config", path, "--example", EXAMPLE])
+        logged = str(error.call_args_list) + str(info.call_args_list)
+        return code, out, err.getvalue(), logged
+
+    def test_masked_summary(self):
+        path = self.config(f"[slack]\nwebhook_url = {self.SECRET_HOOK}\n"
+                           "[display]\nmachine_name = Maja PC\n")
+        code, out, err, logged = self.summary(path)
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertEqual(lines[:3], [
+            "webhook=https://hooks.slack.com/…abcd",
+            "machine_name=Maja PC",
+            "heartbeat=enabled, every 60 min",
+        ])
+        self.assertIn("missing=[boot] include_ipv6 (default: false)", lines)
+        for text in (out, err, logged):
+            self.assertNotIn("SECRET", text)
+            self.assertNotIn("T000", text)
+
+    def test_placeholder_and_disabled(self):
+        path = self.config("[slack]\nwebhook_url = https://hooks.slack.com/services/REPLACE/WITH/"
+                           "YOUR-WEBHOOK\n[heartbeat]\nenabled = false\ninterval_minutes = 30\n")
+        code, out, _err, _logged = self.summary(path)
+        self.assertEqual(code, 0)
+        self.assertIn("webhook=not set", out)
+        self.assertIn("machine_name=not set (hostname only)", out)
+        self.assertIn("heartbeat=disabled", out)
+
+    def test_example_has_nothing_missing(self):
+        code, out, _err, _logged = self.summary(EXAMPLE)
+        self.assertEqual(code, 0)
+        self.assertNotIn("missing=", out)
+
+    def test_broken_file_exits_1_without_quoting(self):
+        path = self.config(f"webhook_url = {self.SECRET_HOOK}\n[slack\n")
+        code, out, err, logged = self.summary(path)
+        self.assertEqual((code, out), (1, ""))
+        for text in (err, logged):
+            self.assertNotIn("SECRET", text)
+
+    def test_missing_file_exits_1(self):
+        code, out, _err, _logged = self.summary("/nonexistent/config.ini")
+        self.assertEqual((code, out), (1, ""))
+
+    def test_hidden_from_help(self):
+        self.assertNotIn("config-summary", cli.build_parser().format_help())
+
+
 if __name__ == "__main__":
     unittest.main()
