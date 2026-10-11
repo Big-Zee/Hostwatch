@@ -1,12 +1,26 @@
 [Unit]
 Description=Slack notification when the host has booted (HostWatch)
 Documentation=https://github.com/Big-Zee/Hostwatch
+# No default dependencies: otherwise multi-user.target would be ordered after
+# this unit and, through it, wait for network-online.target. The ones still
+# needed are declared below (sysinit.target brings the local file systems).
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target basic.target network-online.target
 Wants=network-online.target
-After=network-online.target
+Conflicts=shutdown.target
+Before=shutdown.target
+# With RemainAfterExit below: see the comment there.
+IgnoreOnIsolate=yes
 
 [Service]
-# simple, not oneshot: multi-user.target must not wait for Slack retries.
+# simple, not oneshot: nothing waits for Slack retries.
 Type=simple
+# Stays active after it finishes and, with IgnoreOnIsolate, is left alone by
+# "systemctl isolate", so switching targets never sends a second boot message.
+# Shutdown and soft-reboot still stop it (Conflicts=shutdown.target), so the
+# next boot runs it again.
+RemainAfterExit=yes
 ExecStart=/usr/local/bin/hostwatch boot
 SyslogIdentifier=hostwatch
 TimeoutStopSec=5

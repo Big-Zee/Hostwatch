@@ -1,9 +1,11 @@
 [Unit]
 Description=Slack notification when the host shuts down or reboots (HostWatch)
 Documentation=https://github.com/Big-Zee/Hostwatch
-# Stopped in reverse order: the message is sent before the network and DNS go down.
-Wants=network-online.target
-After=network-online.target nss-lookup.target
+# Stopped in reverse order: the network managers and systemd-resolved are
+# ordered before network.target and nss-lookup.target, so they are still up when
+# ExecStop sends the message. Not network-online.target: at boot that would make
+# multi-user.target wait for the network to come online.
+After=network.target nss-lookup.target
 
 [Service]
 # Active from boot; the work happens in ExecStop at shutdown.
