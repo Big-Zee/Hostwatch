@@ -1,0 +1,132 @@
+import os
+import tempfile
+import unittest
+from unittest import mock
+
+from hostwatch import config
+
+REPO_EXAMPLE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "config.example.ini")
+WEBHOOK = "https://hooks.slack.com/services/T000/B000/XXXXXXXX"
+
+
+class ConfigTest(unittest.TestCase):
+    def write(self, text):
+        fd, path = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_only_webhook_gives_defaults(self):
+        cfg = config.load(self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n"))
+        self.assertEqual(cfg.webhook_url, WEBHOOK)
+        self.assertEqual(cfg.skip_interfaces, config.DEFAULT_SKIP_INTERFACES)
+        self.assertFalse(cfg.include_ipv6)
+        self.assertEqual(cfg.timezone, "local")
+        self.assertEqual(cfg.machine_name, "")
+
+    def test_machine_name(self):
+        cfg = config.load(self.write(
+            f"[slack]\nwebhook_url = {WEBHOOK}\n[display]\nmachine_name =   Office PC  \n"))
+        self.assertEqual(cfg.machine_name, "Office PC")
+        cfg = config.load(self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[display]\nmachine_name =\n"))
+        self.assertEqual(cfg.machine_name, "")
+
+    def test_heartbeat_defaults(self):
+        cfg = config.load(self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n"))
+        self.assertEqual(config.heartbeat_settings(cfg), (True, 60))
+        example = config.load(REPO_EXAMPLE, require_webhook=False)
+        self.assertEqual(config.heartbeat_settings(example), (True, 60))
+
+    def test_heartbeat_values(self):
+        cfg = config.load(self.write(
+            f"[slack]\nwebhook_url = {WEBHOOK}\n[heartbeat]\nenabled = no\ninterval_minutes = 15\n"))
+        self.assertEqual(config.heartbeat_settings(cfg), (False, 15))
+        for edge in ("5", "1440"):
+            cfg = config.load(self.write(
+                f"[slack]\nwebhook_url = {WEBHOOK}\n[heartbeat]\ninterval_minutes = {edge}\n"))
+            self.assertEqual(config.heartbeat_settings(cfg)[1], int(edge))
+
+    def test_invalid_heartbeat_settings(self):
+        for line, setting in (("interval_minutes = 1", "interval_minutes"),
+                              ("interval_minutes = 1441", "interval_minutes"),
+                              ("interval_minutes = hourly", "interval_minutes"),
+                              ("interval_minutes = 7.5", "interval_minutes"),
+                              ("enabled = sometimes", "enabled")):
+            path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[heartbeat]\n{line}\n")
+            cfg = config.load(path)  # loading still works: boot/login are unaffected
+            with self.assertRaisesRegex(config.ConfigError, setting):
+                config.heartbeat_settings(cfg)
+
+    def test_example_leaves_machine_name_unset(self):
+        self.assertEqual(config.load(REPO_EXAMPLE, require_webhook=False).machine_name, "")
+
+    def test_all_settings(self):
+        cfg = config.load(self.write(
+            f"[slack]\nwebhook_url = {WEBHOOK}\n"
+            "[boot]\nskip_interfaces = docker, virbr\ninclude_ipv6 = yes\n"
+            "[display]\ntimezone = Europe/Warsaw\n"
+        ))
+        self.assertEqual(cfg.skip_interfaces, ("docker", "virbr"))
+        self.assertTrue(cfg.include_ipv6)
+        self.assertEqual(cfg.timezone, "Europe/Warsaw")
+
+    def test_path_resolution(self):
+        with mock.patch.dict(os.environ, {config.ENV_VAR: "/tmp/env.ini"}):
+            self.assertEqual(config.resolve_path(), "/tmp/env.ini")
+            self.assertEqual(config.resolve_path("/x.ini"), "/x.ini")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(config.resolve_path(), "/etc/hostwatch/config.ini")
+
+    def test_env_override_is_read(self):
+        path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n")
+        with mock.patch.dict(os.environ, {config.ENV_VAR: path}):
+            self.assertEqual(config.load().webhook_url, WEBHOOK)
+
+    def test_missing_file(self):
+        with self.assertRaisesRegex(config.ConfigError, "cannot read config"):
+            config.load(os.path.join(tempfile.gettempdir(), "does-not-exist.ini"))
+
+    def test_example_has_placeholder_and_is_rejected(self):
+        with self.assertRaisesRegex(config.ConfigError, "webhook not configured"):
+            config.load(REPO_EXAMPLE)
+        cfg = config.load(REPO_EXAMPLE, require_webhook=False)
+        self.assertEqual(cfg.webhook_url, config.PLACEHOLDER_WEBHOOK)
+
+    def test_missing_webhook(self):
+        with self.assertRaisesRegex(config.ConfigError, "webhook not configured"):
+            config.load(self.write("[display]\ntimezone = local\n"))
+
+    def test_non_https_webhook(self):
+        path = self.write("[slack]\nwebhook_url = http://hooks.slack.com/services/a/b/c\n")
+        with self.assertRaisesRegex(config.ConfigError, "https://") as ctx:
+            config.load(path)
+        self.assertNotIn("hooks.slack.com", str(ctx.exception))
+
+    def test_unknown_timezone(self):
+        path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[display]\ntimezone = Mars/Base\n")
+        with self.assertRaisesRegex(config.ConfigError, "unknown timezone"):
+            config.load(path)
+
+    def test_bad_boolean(self):
+        path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[boot]\ninclude_ipv6 = maybe\n")
+        with self.assertRaisesRegex(config.ConfigError, "invalid boolean"):
+            config.load(path)
+
+    def test_unsupported_settings_are_ignored(self):
+        path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n"
+                          "[boot]\nretired_option = maybe\nretired_url = not-a-url\n")
+        cfg = config.load(path)  # must not raise
+        self.assertEqual(cfg.webhook_url, WEBHOOK)
+        self.assertFalse(hasattr(cfg, "retired_option"))
+
+    def test_syntax_error_does_not_leak_webhook(self):
+        path = self.write(f"webhook_url = {WEBHOOK}\n")  # no section header
+        with self.assertRaises(config.ConfigError) as ctx:
+            config.load(path)
+        self.assertNotIn(WEBHOOK, str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

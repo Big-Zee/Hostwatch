@@ -1,0 +1,25 @@
+[Unit]
+Description=Slack notification when the host shuts down or reboots (HostWatch)
+Documentation=https://github.com/Big-Zee/Hostwatch
+# Stopped in reverse order: the message is sent before the network and DNS go down.
+Wants=network-online.target
+After=network-online.target nss-lookup.target
+
+[Service]
+# Active from boot; the work happens in ExecStop at shutdown.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/hostwatch shutdown
+# Hard cap so shutdown is never held up for long (the HTTP timeout alone does
+# not bound DNS lookups).
+TimeoutStopSec=10
+StateDirectory=hostwatch
+SyslogIdentifier=hostwatch
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
