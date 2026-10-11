@@ -29,7 +29,7 @@ def _excluded(user):
 def _run(args, run):
     """Return stdout of a successful command, or None."""
     try:
-        proc = run(args, capture_output=True, text=True, timeout=TIMEOUT)
+        proc = run(args, capture_output=True, text=True, errors="replace", timeout=TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:

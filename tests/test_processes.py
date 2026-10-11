@@ -131,6 +131,22 @@ class FormatTableTest(unittest.TestCase):
         self.assertEqual(lines[3], "    911 averyve+   2.0   0.4  a-very-long-pr+")
         self.assertLessEqual(max(len(l) for l in lines), 45)
 
+    def test_host_values_shown_literally(self):
+        table = processes.format_table([Row(4242, "mallory", 99.0, 0.1, "```<!channel>")])
+        self.assertEqual(table.count("```"), 2)
+        self.assertTrue(table.startswith("```\n") and table.endswith("\n```"))
+        self.assertNotIn("<!", table)
+        self.assertIn("ˋˋˋ&lt;!channel&gt;", table)
+
+    def test_escaping_keeps_columns_aligned(self):
+        table = processes.format_table([Row(1, "a&b", 1.0, 1.0, "x\ty\x1b"),
+                                        Row(2, "alice", 1.0, 1.0, "y")])
+        lines = table.split("\n")
+        self.assertEqual(lines[2], "      1 a&amp;b        1.0   1.0  x?y?")
+        self.assertEqual(lines[3], "      2 alice      1.0   1.0  y")
+        # As Slack renders it (one character per entity), the columns line up.
+        self.assertEqual(lines[2].replace("&amp;", "&").index("1.0"), lines[3].index("1.0"))
+
     def test_empty(self):
         self.assertEqual(processes.format_table([]), "```\n(no process data)\n```")
 

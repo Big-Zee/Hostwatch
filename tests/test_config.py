@@ -73,8 +73,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg.timezone, "Europe/Warsaw")
 
     def test_path_resolution(self):
-        with mock.patch.dict(os.environ, {config.ENV_VAR: "/tmp/env.ini"}):
-            self.assertEqual(config.resolve_path(), "/tmp/env.ini")
+        with mock.patch.dict(os.environ, {config.ENV_VAR: "/etc/hostwatch-test/env.ini"}):
+            self.assertEqual(config.resolve_path(), "/etc/hostwatch-test/env.ini")
             self.assertEqual(config.resolve_path("/x.ini"), "/x.ini")
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(config.resolve_path(), "/etc/hostwatch/config.ini")
@@ -83,6 +83,24 @@ class ConfigTest(unittest.TestCase):
         path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n")
         with mock.patch.dict(os.environ, {config.ENV_VAR: path}):
             self.assertEqual(config.load().webhook_url, WEBHOOK)
+
+    def write_bytes(self, data):
+        fd, path = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_byte_order_mark_is_accepted(self):
+        path = self.write_bytes(b"\xef\xbb\xbf" + f"[slack]\nwebhook_url = {WEBHOOK}\n".encode())
+        self.assertEqual(config.load(path).webhook_url, WEBHOOK)
+
+    def test_invalid_utf8_is_a_config_error(self):
+        path = self.write_bytes(f"[slack]\nwebhook_url = {WEBHOOK}\n"
+                                "[display]\nmachine_name = Pracownia ".encode() + b"\xb3\xf3d\xbc\n")
+        with self.assertRaisesRegex(config.ConfigError, "is not valid UTF-8") as ctx:
+            config.load(path)
+        self.assertNotIn(WEBHOOK, str(ctx.exception))
 
     def test_missing_file(self):
         with self.assertRaisesRegex(config.ConfigError, "cannot read config"):
@@ -103,6 +121,24 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(config.ConfigError, "https://") as ctx:
             config.load(path)
         self.assertNotIn("hooks.slack.com", str(ctx.exception))
+
+    def test_malformed_webhook_rejected_without_quoting_it(self):
+        base = "https://hooks.slack.com/services/T0/B0/XYZ"
+        cases = {
+            "inline comment": f"{base} # prod",
+            "embedded space": "https://hooks.slack.com/services/T0/B0 XYZ",
+            "tab": "https://hooks.slack.com/services/T0/B0\tXYZ",
+            "missing host": "https:///services/T0/B0/XYZ",
+        }
+        for name, value in cases.items():
+            with self.subTest(name):
+                path = self.write(f"[slack]\nwebhook_url = {value}\n")
+                with self.assertRaises(config.ConfigError) as ctx:
+                    config.load(path)
+                message = str(ctx.exception)
+                self.assertIn("inline comments are not supported", message)
+                for part in ("hooks.slack.com", "services", "T0", "B0", "XYZ", "prod"):
+                    self.assertNotIn(part, message)
 
     def test_unknown_timezone(self):
         path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[display]\ntimezone = Mars/Base\n")

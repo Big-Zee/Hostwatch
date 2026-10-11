@@ -55,7 +55,7 @@ SYSTEMCTL_TIMEOUT = 2
 def _systemctl(args, run):
     """Return systemctl's stdout, or None if it cannot be run in time."""
     try:
-        proc = run(["systemctl", *args], capture_output=True, text=True,
+        proc = run(["systemctl", *args], capture_output=True, text=True, errors="replace",
                    timeout=SYSTEMCTL_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -77,7 +77,7 @@ def shutdown_kind(run=subprocess.run):
 
 def local_addresses(skip_prefixes, include_ipv6=False, run=subprocess.run):
     try:
-        proc = run(["ip", "-j", "addr", "show"], capture_output=True, text=True,
+        proc = run(["ip", "-j", "addr", "show"], capture_output=True, text=True, errors="replace",
                    timeout=5, check=True)
         data = json.loads(proc.stdout)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:

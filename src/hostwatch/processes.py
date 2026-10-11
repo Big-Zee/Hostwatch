@@ -8,6 +8,7 @@ multi-core machines. Command lines are never read.
 import mmap
 import os
 import time
+import unicodedata
 from collections import namedtuple
 
 try:
@@ -105,12 +106,25 @@ def _fit(text, width):
     return text if len(text) <= width else text[:width - 1] + "+"
 
 
+def _literal(text):
+    """Make a host-supplied cell plain text inside the code block.
+
+    Done after fitting and padding: Slack shows each entity as one character,
+    so the columns stay aligned. A backtick becomes U+02CB so it cannot close
+    the block; control characters become "?".
+    """
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("`", "ˋ")
+    return "".join("?" if unicodedata.category(c) == "Cc" else c for c in text)
+
+
 def format_table(rows):
     """Fixed-width table in a code block, so columns align on mobile."""
     if not rows:
         return "```\n(no process data)\n```"
     lines = [f"{'PID':>7} {'USER':<{USER_WIDTH}} {'CPU%':>5} {'MEM%':>5}  NAME"]
     for r in rows:
-        lines.append(f"{r.pid:>7} {_fit(r.user, USER_WIDTH):<{USER_WIDTH}} "
-                     f"{r.cpu:>5.1f} {r.mem:>5.1f}  {_fit(r.name, NAME_WIDTH)}")
+        user = _literal(f"{_fit(r.user, USER_WIDTH):<{USER_WIDTH}}")
+        name = _literal(_fit(r.name, NAME_WIDTH))
+        lines.append(f"{r.pid:>7} {user} {r.cpu:>5.1f} {r.mem:>5.1f}  {name}")
     return "```\n" + "\n".join(lines) + "\n```"

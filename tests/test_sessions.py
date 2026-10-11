@@ -119,6 +119,7 @@ class LogindTest(unittest.TestCase):
         self.assertEqual(show_args[:8], ["loginctl", "show-session", "2", "5", "c1", "7", "8", "9"])
         self.assertIn("RemoteHost", show_args)
         self.assertTrue(all(kw["timeout"] == 2 for _, kw in run.calls))
+        self.assertTrue(all(kw["errors"] == "replace" for _, kw in run.calls))
 
     def test_no_sessions(self):
         run = fake_run({"loginctl list-sessions": ""})
@@ -148,6 +149,12 @@ class WhoFallbackTest(unittest.TestCase):
     def test_loginctl_missing(self):
         run = fake_run({"loginctl list-sessions": FileNotFoundError("loginctl"), "who": WHO})
         self.assertEqual(sessions.logged_in_users(run=run), self.expected())
+
+    def test_who_output_decoded_with_replacement(self):
+        run = fake_run({"loginctl list-sessions": None, "who": WHO})
+        sessions.logged_in_users(run=run)
+        self.assertEqual(run.calls[-1][0], ["who"])
+        self.assertEqual(run.calls[-1][1]["errors"], "replace")
 
     def test_loginctl_error_or_timeout(self):
         run = fake_run({"loginctl list-sessions": None, "who": WHO})

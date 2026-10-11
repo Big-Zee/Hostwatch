@@ -76,7 +76,8 @@ def build(machine, event, fields, summary, local_ips, users, notice=None, sectio
     for title, text in sections or ():
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n{text}"}})
     blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": FOOTER}]})
-    return {"text": f"{machine}{SEPARATOR}{summary}", "blocks": blocks}
+    # The header is plain_text and shown as is; the fallback is parsed, so escape it.
+    return {"text": _escape(f"{machine}{SEPARATOR}{summary}"), "blocks": blocks}
 
 
 def boot_message(machine, time_str, boot_time_str, local_ips, users, unclean_previous=False):

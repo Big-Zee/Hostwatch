@@ -2,6 +2,7 @@
 import configparser
 import os
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_PATH = "/etc/hostwatch/config.ini"
@@ -46,10 +47,13 @@ def load(path=None, require_webhook=True):
     path = resolve_path(path)
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        with open(path, encoding="utf-8") as fh:
+        # utf-8-sig drops the byte-order mark some Windows editors write.
+        with open(path, encoding="utf-8-sig") as fh:
             parser.read_file(fh)
     except OSError as exc:
         raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"config {path} is not valid UTF-8") from None
     except configparser.Error:
         # The parser's message can quote the offending line, which may be the webhook.
         raise ConfigError(f"invalid syntax in config {path}") from None
@@ -95,12 +99,27 @@ def heartbeat_settings(cfg):
     return enabled, interval
 
 
+def _well_formed(url):
+    """No whitespace or control characters, and a host after the scheme."""
+    if any(c.isspace() or not c.isprintable() for c in url):
+        return False
+    try:
+        return bool(urlsplit(url).hostname)
+    except ValueError:  # e.g. an unbalanced "[" in the host
+        return False
+
+
 def validate(cfg, require_webhook=True):
     if require_webhook:
         if not cfg.webhook_url or cfg.webhook_url == PLACEHOLDER_WEBHOOK:
             raise ConfigError("webhook not configured: set webhook_url in [slack]")
         if not cfg.webhook_url.startswith("https://"):
             raise ConfigError("webhook_url must be an https:// URL")
+        # Never quote the value: it is the secret. An inline "# comment" is the
+        # usual cause, since configparser keeps it as part of the value.
+        if not _well_formed(cfg.webhook_url):
+            raise ConfigError("webhook_url is not a valid URL (it must not contain spaces; "
+                              "inline comments are not supported)")
     if cfg.timezone != "local":
         try:
             ZoneInfo(cfg.timezone)

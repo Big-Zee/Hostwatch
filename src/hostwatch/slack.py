@@ -20,6 +20,8 @@ def _retryable(status):
 
 def _describe(exc):
     # Never use str(request) or the URL here: the webhook is a secret.
+    if isinstance(exc, (http.client.InvalidURL, ValueError)):
+        return type(exc).__name__  # their text quotes the URL
     reason = getattr(exc, "reason", None) or exc
     return f"{type(exc).__name__}: {reason}"
 
@@ -33,6 +35,9 @@ def post(webhook_url, payload, delays=(), *, event="message", timeout=TIMEOUT,
     ``delays`` are the waits between attempts, so attempts = len(delays) + 1.
     Network errors, timeouts, 429 and 5xx are retried; other 4xx are not.
     """
+    if not webhook_url.startswith("https://"):
+        log.error(f"{event}: webhook URL is not https://, not sending")
+        return False
     attempts = len(delays) + 1
     last = "no attempt made"
     for attempt in range(1, attempts + 1):
@@ -44,7 +49,8 @@ def post(webhook_url, payload, delays=(), *, event="message", timeout=TIMEOUT,
             method="POST",
         )
         try:
-            with urlopen(request, timeout=timeout) as response:
+            # B310: the https:// check above keeps file: and custom schemes out.
+            with urlopen(request, timeout=timeout) as response:  # nosec B310
                 response.read()
             log.info(f"{event}: delivered to Slack (attempt {attempt}/{attempts})")
             return True
@@ -53,7 +59,7 @@ def post(webhook_url, payload, delays=(), *, event="message", timeout=TIMEOUT,
             if not _retryable(exc.code):
                 log.error(f"{event}: Slack rejected the message ({last}), not retrying")
                 return False
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, http.client.HTTPException, ValueError) as exc:
             last = _describe(exc)
         if attempt < attempts:
             delay = delays[attempt - 1]

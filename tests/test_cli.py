@@ -218,6 +218,87 @@ class SendTest(unittest.TestCase):
         self.assertIn("unexpected error", error.call_args.args[0])
 
 
+@mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
+@mock.patch.object(cli.netinfo, "local_addresses", return_value=[])
+@mock.patch.object(cli.os, "fork", create=True)  # the real detach path needs fork
+@mock.patch.object(cli.os, "_exit")
+@mock.patch.object(cli.signal, "alarm", create=True)
+class LoginDeadlineTest(unittest.TestCase):
+    ENV = {"PAM_TYPE": "open_session", "PAM_SERVICE": "sshd", "PAM_USER": "alice"}
+
+    def setUp(self):
+        self.config = write_config()
+        self.addCleanup(os.remove, self.config)
+
+    def login(self, *extra, **kw):
+        args = cli.build_parser().parse_args(["login", "--config", self.config, *extra])
+        out = io.StringIO()
+        with mock.patch.object(cli.slack, "post", return_value=True) as post, \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(cli.run_login(args, environ=self.ENV, **kw), 0)
+        return post
+
+    def test_real_detached_child_sets_alarm_before_work(self, alarm, exit_, *_):
+        order = mock.Mock()
+        alarm.side_effect = lambda s: order.alarm(s)
+        wait = mock.Mock(side_effect=lambda *a: order.wait())
+        with mock.patch.object(cli, "_detach", return_value=True):
+            post = self.login(wait=wait)
+        alarm.assert_called_once_with(60)
+        self.assertEqual([c[0] for c in order.mock_calls], ["alarm", "wait"])
+        post.assert_called_once()
+        exit_.assert_called_once_with(0)
+
+    def test_real_parent_sets_no_alarm(self, alarm, exit_, *_):
+        with mock.patch.object(cli, "_detach", return_value=False):
+            post = self.login()
+        alarm.assert_not_called()
+        post.assert_not_called()
+        exit_.assert_not_called()
+
+    def test_injected_detach_and_dry_run_set_no_alarm(self, alarm, exit_, *_):
+        self.login(detach=lambda: True, wait=mock.Mock())
+        with mock.patch.object(cli, "_detach") as real:
+            self.login("--dry-run")
+        real.assert_not_called()
+        alarm.assert_not_called()
+        exit_.assert_not_called()
+
+
+@mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
+@mock.patch.object(cli.netinfo, "local_addresses", return_value=[])
+class LoginConfigPathTest(unittest.TestCase):
+    ENV = {"PAM_TYPE": "open_session", "PAM_SERVICE": "sshd", "PAM_USER": "alice"}
+
+    def setUp(self):
+        fd, self.other = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[display]\nmachine_name = Test Box\n")
+        self.addCleanup(os.remove, self.other)
+
+    @mock.patch.object(cli.log, "error")
+    def test_hook_ignores_env_override(self, _error, *_):
+        args = cli.build_parser().parse_args(["login"])
+        with mock.patch.dict(os.environ, {cli.config.ENV_VAR: self.other}), \
+                mock.patch.object(cli.config, "load", wraps=cli.config.load) as load, \
+                mock.patch.object(cli.slack, "post"):
+            cli.run_login(args, environ=self.ENV, detach=lambda: True, wait=mock.Mock())
+        self.assertEqual(load.call_args.args[0], "/etc/hostwatch/config.ini")
+
+    def test_explicit_config_still_used(self, *_):
+        args = cli.build_parser().parse_args(["login", "--config", self.other])
+        with mock.patch.object(cli.slack, "post", return_value=True) as post:
+            cli.run_login(args, environ=self.ENV, detach=lambda: True, wait=mock.Mock())
+        self.assertTrue(post.call_args.args[1]()["text"].startswith("Test Box (my-pc) · "))
+
+    def test_dry_run_from_shell_honours_env_override(self, *_):
+        env = dict(self.ENV, **{cli.config.ENV_VAR: self.other})
+        with mock.patch.dict(os.environ, env):
+            code, out = run(["login", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out)["text"].startswith("Test Box (my-pc) · alice logged in"))
+
+
 def write_config():
     fd, path = tempfile.mkstemp(suffix=".ini")
     with os.fdopen(fd, "w") as fh:
@@ -261,6 +342,25 @@ class BootMarkerTest(unittest.TestCase):
             cli.main(["boot", "--config", EXAMPLE])  # placeholder webhook -> config error
         post.assert_not_called()
         self.assertFalse(os.path.exists(marker_path()))
+
+    @mock.patch.object(cli.log, "error")
+    def test_unexpected_error_exits_zero_and_consumes_marker_once(self, error, *_):
+        set_marker(True)
+        bad = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+        def post(url, payload, *a, **kw):
+            payload()  # builds the message, as slack.post does on each attempt
+            return True
+
+        with mock.patch.object(cli, "_identity", side_effect=bad), \
+                mock.patch.object(cli.state, "consume_clean",
+                                  wraps=cli.state.consume_clean) as consume, \
+                mock.patch.object(cli.slack, "post", side_effect=post):
+            self.assertEqual(cli.main(["boot", "--config", self.config]), 0)
+        consume.assert_called_once_with()
+        self.assertFalse(os.path.exists(marker_path()))
+        self.assertRegex(error.call_args.args[0],
+                         r"^boot: unexpected error: UnicodeDecodeError at \S+\.py:\d+$")
 
     def test_dry_run_leaves_marker(self, _warning, _ips, _host):
         set_marker(True)
@@ -394,6 +494,55 @@ class IdentityTest(unittest.TestCase):
             self.assertIn("alice · desktop", body)
             self.assertIn("alice · ssh from 203.0.113.7", body)
 
+
+
+SECRET_ERROR = RuntimeError("https://hooks.slack.com/services/SECRET")
+
+
+@mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
+@mock.patch.object(cli.netinfo, "local_addresses", return_value=[])
+@mock.patch.object(cli.log, "error")
+class UnexpectedErrorLogTest(unittest.TestCase):
+    """Catch-alls name the error type and location, never the exception text."""
+
+    def setUp(self):
+        self.config = write_config()
+        self.addCleanup(os.remove, self.config)
+
+    def assert_logged_without_secret(self, error, event):
+        message = error.call_args.args[0]
+        self.assertRegex(message, rf"^{event}: unexpected error: RuntimeError at \S+\.py:\d+$")
+        self.assertNotIn("SECRET", message)
+
+    def test_heartbeat(self, error, *_):
+        with mock.patch.object(cli.processes, "top_processes", side_effect=SECRET_ERROR):
+            self.assertEqual(cli.main(["heartbeat", "--config", self.config]), 0)
+        self.assert_logged_without_secret(error, "heartbeat")
+
+    def test_shutdown(self, error, *_):
+        with mock.patch.object(cli.netinfo, "system_stopping", return_value=True), \
+                mock.patch.object(cli.slack, "post", side_effect=SECRET_ERROR):
+            self.assertEqual(cli.main(["shutdown", "--config", self.config]), 0)
+        self.assert_logged_without_secret(error, "shutdown")
+
+    def test_login(self, error, *_):
+        args = cli.build_parser().parse_args(["login", "--config", self.config])
+        env = {"PAM_TYPE": "open_session", "PAM_SERVICE": "sshd", "PAM_USER": "alice"}
+        with mock.patch.object(cli.slack, "post", side_effect=SECRET_ERROR):
+            self.assertEqual(cli.run_login(args, environ=env, detach=lambda: True), 0)
+        self.assert_logged_without_secret(error, "login")
+
+    def test_location_is_innermost_frame(self, error, *_):
+        def fail():
+            raise RuntimeError("SECRET")
+
+        try:
+            fail()
+        except RuntimeError as exc:
+            cli._log_unexpected("boot", exc)
+        line = fail.__code__.co_firstlineno + 1
+        self.assertEqual(error.call_args.args[0],
+                         f"boot: unexpected error: RuntimeError at test_cli.py:{line}")
 
 
 TOP = [cli.processes.Row(2412, "alice", 98.0, 3.1, "yes")]

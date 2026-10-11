@@ -70,6 +70,11 @@ class LocalAddressesTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], ["ip", "-j", "addr", "show"])
         self.assertEqual(result[0], ("enp3s0", "192.168.1.20"))
 
+    def test_undecodable_output_is_replaced(self):
+        run = mock.Mock(return_value=SimpleNamespace(stdout="[]"))
+        netinfo.local_addresses((), run=run)
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+
     @mock.patch.object(netinfo.log, "warning")
     def test_command_failure_gives_empty_list(self, _warning):
         run = mock.Mock(side_effect=subprocess.CalledProcessError(1, "ip"))
@@ -105,6 +110,12 @@ class ShutdownDetectionTest(unittest.TestCase):
         self.assertEqual(netinfo.shutdown_kind(run=failing), "Shutting down")
         missing = mock.Mock(side_effect=FileNotFoundError("systemctl"))
         self.assertEqual(netinfo.shutdown_kind(run=missing), "Shutting down")
+
+    def test_systemctl_output_decoded_with_replacement(self):
+        for call in (netinfo.system_stopping, netinfo.shutdown_kind):
+            run = systemctl_out("")
+            call(run=run)
+            self.assertEqual(run.call_args.kwargs["errors"], "replace", call.__name__)
 
     def test_system_stopping(self):
         self.assertTrue(netinfo.system_stopping(run=systemctl_out("stopping\n")))
