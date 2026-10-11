@@ -25,10 +25,17 @@ The only network request HostWatch makes is the message to Slack. It is plain Py
 2. From a checkout of this repository, run:
 
    ```bash
-   sudo SLACK_WEBHOOK_URL='https://hooks.slack.com/services/...' ./install.sh
+   sudo ./install.sh
    ```
 
-   Without `SLACK_WEBHOOK_URL`, the script asks for the URL (the input is hidden). Leave it empty to edit the config later.
+   The script asks for the webhook URL; the input is hidden. Leave it empty to edit the config later. To pass the URL without a prompt (for example from a script), put it in the environment instead:
+
+   ```bash
+   read -rs SLACK_WEBHOOK_URL && export SLACK_WEBHOOK_URL
+   sudo --preserve-env=SLACK_WEBHOOK_URL ./install.sh
+   ```
+
+   Don't type the URL as part of a command (for example as a `VAR=value` prefix to `sudo`): shell history, process listings (`ps`) and sudo's log would all record the secret. A URL containing spaces, such as one followed by a `# comment`, is refused and the placeholder is kept.
 3. Check it works:
 
    ```bash
@@ -42,11 +49,19 @@ The only network request HostWatch makes is the message to Slack. It is plain Py
 - installs `hostwatch-boot.service` and enables it
 - installs `hostwatch-shutdown.service`, enables it and starts it, so the very next shutdown is announced
 - installs `hostwatch-heartbeat.timer` / `.service`, applies `[heartbeat] interval_minutes` to the timer, and starts it
-- creates `/var/lib/hostwatch/` and records a clean state, so the first boot shows no unclean-shutdown warning
-- adds the login hook with `pam-auth-update`
+- on first install, creates `/var/lib/hostwatch/` and records a clean state, so the first boot shows no unclean-shutdown warning
+- adds the login hook with `pam-auth-update` and checks that it is in `/etc/pam.d/common-session`
 - creates `/etc/hostwatch/config.ini` (root, mode `600`) from `config.example.ini`
 
-Running it again updates the program and keeps your config.
+Running it again updates the program and keeps your config. It also resets the config to `root:root`, mode `600`, if that was changed, and leaves the clean-shutdown record alone.
+
+**If `install.sh` says the login hook is not active:** `/etc/pam.d/common-session` was edited by hand, and `pam-auth-update` does not change a hand-edited file. Everything else is installed. Add this line to that file yourself:
+
+```
+session optional pam_exec.so quiet /usr/local/bin/hostwatch login
+```
+
+`uninstall.sh` stops with a similar message, before removing anything, when it cannot take the line out; delete it by hand and run it again.
 
 ## Configuration
 
@@ -67,7 +82,7 @@ Changes take effect at the next boot, shutdown or login. There is no daemon to r
 ## Using HostWatch on several machines
 
 One Slack channel can serve any number of PCs:
-1. Use the same incoming webhook on every machine (`SLACK_WEBHOOK_URL=… ./install.sh`).
+1. Use the same incoming webhook on every machine: paste it at the `sudo ./install.sh` prompt, or use the `read -rs` / `sudo --preserve-env=SLACK_WEBHOOK_URL` form from [Install](#install). Keep it off the command line.
 2. Optionally give each machine a friendly name in `/etc/hostwatch/config.ini`:
 
    ```ini
@@ -107,7 +122,7 @@ Top processes (CPU over 1 s, % of one core)
     911 root       2.0   0.4  Xorg
 ```
 
-- **Schedule.** The schedule counts from boot, not the clock: the first heartbeat comes one interval after boot, then one every interval. The interval is `[heartbeat] interval_minutes` (default 60). `install.sh` writes it into a drop-in at `/etc/systemd/system/hostwatch-heartbeat.timer.d/interval.conf`.
+- **Schedule.** The schedule counts from boot, not the clock: the first heartbeat comes one interval after boot, then one every interval. The interval is `[heartbeat] interval_minutes` (default 60). `install.sh` writes it into a drop-in at `/etc/systemd/system/hostwatch-heartbeat.timer.d/interval.conf`. On a first install, a host that has already been up longer than one interval sends one heartbeat right away.
 - **Changing the interval.** Run `sudo ./install.sh` again after editing it. If the machine has been up longer than the new interval, systemd sends one heartbeat right away. A re-run with an unchanged interval sends nothing.
 - **Turning it off.** Set `enabled = false`. It takes effect at the next run, with no reinstall. Boot, login and shutdown messages keep working.
 - **Top processes.** HostWatch reads `/proc` twice, one second apart, so the table shows CPU use *now* (a single `ps` reading is a lifetime average).
@@ -120,7 +135,9 @@ Top processes (CPU over 1 s, % of one core)
 
 ## Shutdown and unclean-shutdown detection
 
-`hostwatch-shutdown.service` does nothing while the PC runs. Its stop action (`hostwatch shutdown`) runs when systemd stops it during poweroff or reboot. The unit is ordered after `network-online.target`, and systemd stops units in reverse order, so the message goes out while the network and DNS are still up.
+`hostwatch-boot.service` starts once the network is online, but nothing in the boot waits for it. It is declared without systemd's default dependencies, so `multi-user.target` is reached on time even when the network never comes online (an offline boot is not slowed down by HostWatch). After sending, the unit stays active and is ignored by `systemctl isolate`, so switching targets (for example to `rescue.target` and back) sends no second boot message.
+
+`hostwatch-shutdown.service` does nothing while the PC runs. Its stop action (`hostwatch shutdown`) runs when systemd stops it during poweroff or reboot. The unit is ordered after `network.target` and `nss-lookup.target`, and systemd stops units in reverse order. The network managers and systemd-resolved are ordered before those targets, so the message goes out while the network and DNS are still up. It is not ordered after `network-online.target`, so it does not make the boot wait for the network either.
 
 - **Event type.** The kind of shutdown is read from systemd's job queue: `reboot.target` means "Rebooting", and `poweroff.target`, `halt.target` or anything unknown means "Shutting down".
 - **Never holds up shutdown.** HostWatch makes one delivery attempt with a 5 s timeout and no retries, and the unit is capped at 10 s (`TimeoutStopSec`). A failure is logged and shutdown carries on.
@@ -173,7 +190,7 @@ PAM_TYPE=open_session PAM_SERVICE=sshd PAM_USER=alice PAM_RHOST=203.0.113.7 \
   hostwatch login --dry-run
 ```
 
-`--config PATH` (or the `HOSTWATCH_CONFIG` environment variable) uses a different config file. From a checkout, run `bin/hostwatch` instead of `hostwatch`.
+`--config PATH` (or the `HOSTWATCH_CONFIG` environment variable) uses a different config file. The login hook ignores `HOSTWATCH_CONFIG` outside dry runs, because PAM assembles its environment; it always reads `/etc/hostwatch/config.ini`. From a checkout, run `bin/hostwatch` instead of `hostwatch`.
 
 ## Troubleshooting
 
@@ -189,6 +206,7 @@ grep hostwatch /etc/pam.d/common-session
 
 Common log messages:
 - `webhook not configured`: set `webhook_url` in the config.
+- `webhook_url is not a valid URL`: the value contains a space, often from an inline `# comment`. Comments must be on their own line.
 - `Slack rejected the message (HTTP 404)`: the webhook was revoked or mistyped.
 - `giving up after N attempt(s)`: the network or Slack was unreachable.
 
