@@ -14,6 +14,8 @@ HEARTBEAT_DROPIN_DIR=/etc/systemd/system/hostwatch-heartbeat.timer.d
 PAM_PROFILE=/usr/share/pam-configs/hostwatch
 CONF_DIR=/etc/hostwatch
 STATE_DIR=/var/lib/hostwatch
+PAM_SESSION=/etc/pam.d/common-session
+PAM_HOOK_RE='pam_exec\.so.*/usr/local/bin/hostwatch login'
 
 purge=0
 case "${1:-}" in
@@ -31,31 +33,46 @@ fi
 if [[ -e "$PAM_PROFILE" ]]; then
     echo "Removing login hook"
     pam-auth-update --package --remove hostwatch
-    rm -f "$PAM_PROFILE"
 fi
+# pam-auth-update silently leaves a hand-edited common-session unchanged. Stop
+# here, before anything is removed, so logins never exec a missing program.
+if grep -Eq "$PAM_HOOK_RE" "$PAM_SESSION" 2>/dev/null; then
+    cat >&2 <<EOF
+uninstall.sh: the login hook is still in $PAM_SESSION (pam-auth-update does
+not change a hand-edited file). Nothing was removed. Delete this line by hand,
+then run uninstall.sh again:
 
+    session optional pam_exec.so quiet /usr/local/bin/hostwatch login
+EOF
+    exit 1
+fi
+rm -f "$PAM_PROFILE"
+
+# Every disable runs even when the unit file is already gone; the enablement
+# links it then cannot find are removed below.
+echo "Removing shutdown notification"
 # Stopping it runs its ExecStop, which sends nothing because the system is
 # not shutting down.
-if [[ -e "$SHUTDOWN_UNIT" ]]; then
-    echo "Removing shutdown notification"
-    systemctl disable --now hostwatch-shutdown.service || true
-    rm -f "$SHUTDOWN_UNIT"
-fi
+systemctl disable --now hostwatch-shutdown.service || true
 
-if [[ -e "$HEARTBEAT_TIMER" || -e "$HEARTBEAT_SERVICE" || -d "$HEARTBEAT_DROPIN_DIR" ]]; then
-    echo "Removing heartbeat"
-    systemctl disable --now hostwatch-heartbeat.timer || true
-    systemctl stop hostwatch-heartbeat.service || true
-    rm -f "$HEARTBEAT_TIMER" "$HEARTBEAT_SERVICE"
-    rm -rf "$HEARTBEAT_DROPIN_DIR"
-fi
+echo "Removing heartbeat"
+systemctl disable --now hostwatch-heartbeat.timer || true
+systemctl stop hostwatch-heartbeat.service || true
 
-if [[ -e "$UNIT" ]]; then
-    echo "Removing boot notification"
-    systemctl disable hostwatch-boot.service || true
-    rm -f "$UNIT"
-fi
+echo "Removing boot notification"
+# --now: a boot notification that is still retrying must not send afterwards.
+systemctl disable --now hostwatch-boot.service || true
+
+rm -f "$UNIT" "$SHUTDOWN_UNIT" "$HEARTBEAT_TIMER" "$HEARTBEAT_SERVICE"
+rm -rf "$HEARTBEAT_DROPIN_DIR"
+rm -f /etc/systemd/system/multi-user.target.wants/hostwatch-boot.service \
+    /etc/systemd/system/multi-user.target.wants/hostwatch-shutdown.service \
+    /etc/systemd/system/timers.target.wants/hostwatch-heartbeat.timer
 systemctl daemon-reload
+for unit in hostwatch-boot.service hostwatch-shutdown.service \
+        hostwatch-heartbeat.service hostwatch-heartbeat.timer; do
+    systemctl reset-failed "$unit" 2>/dev/null || true
+done
 
 echo "Removing program files"
 rm -f "$BIN"

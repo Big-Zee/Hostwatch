@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Install HostWatch: boot, shutdown, heartbeat and login notifications to Slack.
 #
-#   sudo ./install.sh
-#   sudo SLACK_WEBHOOK_URL=https://hooks.slack.com/services/... ./install.sh
+#   sudo ./install.sh         # asks for the webhook URL; the input is hidden
+#
+# or, to pass it through the environment:
+#
+#   read -rs SLACK_WEBHOOK_URL && export SLACK_WEBHOOK_URL
+#   sudo --preserve-env=SLACK_WEBHOOK_URL ./install.sh
+#
+# Never put the webhook on a command line: shell history, process listings
+# and sudo logs record it.
 #
 # Safe to run again: program files are updated, an existing config is kept.
 set -euo pipefail
@@ -18,6 +25,8 @@ PAM_PROFILE=/usr/share/pam-configs/hostwatch
 CONF_DIR=/etc/hostwatch
 CONF="$CONF_DIR/config.ini"
 STATE_DIR=/var/lib/hostwatch
+PAM_SESSION=/etc/pam.d/common-session
+PAM_HOOK_RE='pam_exec\.so.*/usr/local/bin/hostwatch login'
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -45,10 +54,13 @@ install -m 644 "$SRC_DIR/systemd/hostwatch-heartbeat.service" "$HEARTBEAT_SERVIC
 install -m 644 "$SRC_DIR/systemd/hostwatch-heartbeat.timer" "$HEARTBEAT_TIMER"
 install -m 644 "$SRC_DIR/pam/hostwatch" "$PAM_PROFILE"
 
-# Record a clean state so the first boot after install shows no
-# unclean-shutdown warning.
-install -d -m 755 -o root -g root "$STATE_DIR"
-: > "$STATE_DIR/clean_shutdown"
+# First install only: record a clean state so the first boot after install
+# shows no unclean-shutdown warning. A re-run leaves the record alone, so a
+# crash after it is still reported.
+if [[ ! -d $STATE_DIR ]]; then
+    install -d -m 755 -o root -g root "$STATE_DIR"
+    : > "$STATE_DIR/clean_shutdown"
+fi
 
 install -d -m 755 -o root -g root "$CONF_DIR"
 if [[ -e "$CONF" ]]; then
@@ -65,6 +77,10 @@ else
     if [[ -n "$webhook" ]]; then
         if [[ "$webhook" != https://* ]]; then
             echo "install.sh: webhook must start with https:// - keeping the placeholder" >&2
+        elif [[ "$webhook" =~ [[:space:][:cntrl:]] ]]; then
+            # Not printed: it is the secret.
+            echo "install.sh: webhook is invalid (it contains spaces or control characters," \
+                "for example an inline comment) - keeping the placeholder" >&2
         else
             tmp="$(umask 077 && mktemp "$CONF_DIR/.config.XXXXXX")"
             # Passed through the environment, never on a command line.
@@ -78,6 +94,14 @@ else
         fi
     fi
     unset webhook
+fi
+
+# The file holds the webhook secret: keep it root-only, also when it was
+# created or changed by hand.
+if [[ "$(stat -c '%U:%G %a' "$CONF")" != "root:root 600" ]]; then
+    chown root:root "$CONF"
+    chmod 600 "$CONF"
+    echo "Corrected the permissions of $CONF to root:root 600"
 fi
 
 if grep -q "REPLACE/WITH/YOUR-WEBHOOK" "$CONF"; then
@@ -126,6 +150,18 @@ fi
 
 echo "Enabling login hook"
 pam-auth-update --package --enable hostwatch
+# pam-auth-update silently leaves a hand-edited common-session unchanged.
+if ! grep -Eq "$PAM_HOOK_RE" "$PAM_SESSION"; then
+    cat >&2 <<EOF
+install.sh: the login hook is NOT active: $PAM_SESSION has no HostWatch line.
+pam-auth-update does not change a hand-edited $PAM_SESSION. Add this line to it:
+
+    session optional pam_exec.so quiet /usr/local/bin/hostwatch login
+
+Everything else is installed: boot, shutdown and heartbeat messages work.
+EOF
+    exit 1
+fi
 
 echo
 echo "Done. Send a test message with:  sudo hostwatch test"
