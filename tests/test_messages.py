@@ -80,6 +80,14 @@ class SharedFormatTest(unittest.TestCase):
         self.assertEqual(f["Local IP"], "_no local IP_")
         self.assertEqual(f["Kernel boot"], "_unknown_")
 
+    def test_fallback_escaped_header_literal(self):
+        machine = messages.machine_label("host", "Lab <A&B>")
+        p = messages.boot_message(machine, T, T, IPS, USERS)
+        self.assertEqual(p["text"], f"Lab &lt;A&amp;B&gt; (host) · Booted at {T}")
+        self.assertEqual(header(p), ":desktop_computer: Lab <A&B> (host) · Boot")
+        login = messages.login_message("host", "<!here>", "SSH", T, IPS, [], rhost="203.0.113.7")
+        self.assertNotIn("<", login["text"])
+
     def test_escaping_and_header_limit(self):
         users = [Session("<b>&", "tty", None, 1)]
         payload = messages.login_message("h" * 200, "<b>&", "TTY", "t", IPS, users, tty="tty3")

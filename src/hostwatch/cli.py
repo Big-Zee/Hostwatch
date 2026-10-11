@@ -2,8 +2,11 @@
 import argparse
 import json
 import os
+import signal
 
 from . import config, log, messages, netinfo, processes, sessions, slack, state, timefmt
+
+LOGIN_DEADLINE = 60  # seconds the detached login sender may live
 
 # PAM service -> login type. Anything not listed (su, sudo, cron, systemd-user,
 # gdm-launch-environment, ...) is ignored.
@@ -28,20 +31,36 @@ def login_type(pam_type, service):
     return LOGIN_SERVICES.get(service or "")
 
 
-def _load_config(args, event):
+def _load_config(args, event, default_path=None):
     """Return the config, or None after logging why it cannot be used.
 
-    Dry runs fall back to defaults so a payload can be previewed anywhere.
+    ``default_path`` replaces the usual lookup ($HOSTWATCH_CONFIG, then the
+    default path) when no --config was given. Dry runs fall back to defaults
+    so a payload can be previewed anywhere.
     """
     dry_run = getattr(args, "dry_run", False)
     try:
-        return config.load(getattr(args, "config", None), require_webhook=not dry_run)
+        return config.load(getattr(args, "config", None) or default_path,
+                           require_webhook=not dry_run)
     except config.ConfigError as exc:
         if dry_run:
             log.warning(f"{event}: {exc}; dry run uses default settings")
             return config.Config()
         log.error(f"{event}: {exc}")
         return None
+
+
+def _log_unexpected(event, exc):
+    """Log an unexpected error by type and location only.
+
+    The exception text is left out: it can quote the webhook URL.
+    """
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    where = (f" at {os.path.basename(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}"
+             if tb is not None else "")
+    log.error(f"{event}: unexpected error: {type(exc).__name__}{where}")
 
 
 def _deliver(args, cfg, payload, delays, event, timeout=slack.TIMEOUT):
@@ -60,20 +79,23 @@ def run_boot(args):
     clean = state.peek_clean() if dry_run else state.consume_clean()
     if not clean:
         log.warning("boot: previous shutdown was not clean")
-    cfg = _load_config(args, "boot")
-    if cfg is None:
-        return 0
-    time_str = timefmt.format_time(timefmt.now(), cfg.timezone)
-    boot_time = timefmt.kernel_boot_time()
-    boot_str = timefmt.format_time(boot_time, cfg.timezone) if boot_time else None
+    try:
+        cfg = _load_config(args, "boot")
+        if cfg is None:
+            return 0
+        time_str = timefmt.format_time(timefmt.now(), cfg.timezone)
+        boot_time = timefmt.kernel_boot_time()
+        boot_str = timefmt.format_time(boot_time, cfg.timezone) if boot_time else None
 
-    def build():
-        # Rebuilt on each attempt: addresses may appear only after the first try.
-        machine, ips, users = _identity(cfg)
-        return messages.boot_message(machine, time_str, boot_str, ips, users,
-                                     unclean_previous=not clean)
+        def build():
+            # Rebuilt on each attempt: addresses may appear only after the first try.
+            machine, ips, users = _identity(cfg)
+            return messages.boot_message(machine, time_str, boot_str, ips, users,
+                                         unclean_previous=not clean)
 
-    _deliver(args, cfg, build, slack.BOOT_DELAYS, "boot")
+        _deliver(args, cfg, build, slack.BOOT_DELAYS, "boot")
+    except Exception as exc:  # a failed unit would mark boot "degraded"
+        _log_unexpected("boot", exc)
     return 0
 
 
@@ -117,7 +139,7 @@ def run_heartbeat(args):
         )
         _deliver(args, cfg, payload, (), "heartbeat", timeout=slack.HEARTBEAT_TIMEOUT)
     except Exception as exc:  # a bug must not fail the unit; the next tick tries again
-        log.error(f"heartbeat: unexpected error: {type(exc).__name__}: {exc}")
+        _log_unexpected("heartbeat", exc)
     return 0
 
 
@@ -157,7 +179,7 @@ def run_shutdown(args):
         )
         _deliver(args, cfg, payload, (), "shutdown", timeout=slack.SHUTDOWN_TIMEOUT)
     except Exception as exc:  # never let a bug fail the stop job
-        log.error(f"shutdown: unexpected error: {type(exc).__name__}: {exc}")
+        _log_unexpected("shutdown", exc)
     return 0
 
 
@@ -184,7 +206,7 @@ def _detach():
     return True
 
 
-def run_login(args, environ=None, detach=_detach, wait=None):
+def run_login(args, environ=None, detach=None, wait=None):
     env = os.environ if environ is None else environ
     wait = wait or sessions.wait_for_session
     kind = login_type(env.get("PAM_TYPE"), env.get("PAM_SERVICE"))
@@ -196,10 +218,18 @@ def run_login(args, environ=None, detach=_detach, wait=None):
     moment = timefmt.now()
 
     dry_run = getattr(args, "dry_run", False)
-    if not dry_run and not detach():
+    # The real double-fork (not an injected detach, a dry run or a fork-less system).
+    detached = not dry_run and detach is None and hasattr(os, "fork")
+    if not dry_run and not (detach or _detach)():
         return 0
+    if detached:
+        # Bound the background sender. No handler: the default action ends the
+        # process even inside a hung DNS lookup, where a Python handler never runs.
+        signal.alarm(LOGIN_DEADLINE)
     try:
-        cfg = _load_config(args, "login")
+        # As a PAM hook this runs as root with an environment PAM assembled, so
+        # $HOSTWATCH_CONFIG is ignored; dry runs and --config still work.
+        cfg = _load_config(args, "login", None if dry_run else config.DEFAULT_PATH)
         if cfg is not None:
             if not dry_run:
                 # pam_systemd may register this session after our hook started;
@@ -214,8 +244,8 @@ def run_login(args, environ=None, detach=_detach, wait=None):
 
             _deliver(args, cfg, build, slack.LOGIN_DELAYS, f"login ({user}, {kind})")
     except Exception as exc:  # never let a bug surface in the login path
-        log.error(f"login: unexpected error: {type(exc).__name__}: {exc}")
-    if not dry_run and detach is _detach and hasattr(os, "fork"):
+        _log_unexpected("login", exc)
+    if detached:
         os._exit(0)  # detached child: do not return into the caller
     return 0
 
