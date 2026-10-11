@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic HostWatch heartbeat
+Documentation=https://github.com/Big-Zee/Hostwatch
+
+[Timer]
+# Relative to boot, not the wall clock. install.sh overrides both values with
+# [heartbeat] interval_minutes in a drop-in (hostwatch-heartbeat.timer.d/).
+OnBootSec=60min
+OnUnitActiveSec=60min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

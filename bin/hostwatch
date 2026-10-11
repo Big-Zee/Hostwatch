@@ -1,0 +1,22 @@
+#!/usr/bin/python3 -I
+"""Entry point for HostWatch.
+
+Runs from the installed library (/usr/local/lib/hostwatch) or, when
+started from a repository checkout, from the checkout's src/ directory.
+"""
+import os
+import sys
+
+INSTALLED_LIB = "/usr/local/lib/hostwatch"
+CHECKOUT_SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "src"
+)
+
+if os.path.isdir(os.path.join(CHECKOUT_SRC, "hostwatch")):
+    sys.path.insert(0, CHECKOUT_SRC)
+else:
+    sys.path.insert(0, INSTALLED_LIB)
+
+from hostwatch import cli  # noqa: E402
+
+sys.exit(cli.main())

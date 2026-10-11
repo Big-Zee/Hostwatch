@@ -1,0 +1,21 @@
+[Unit]
+Description=Slack notification when the host has booted (HostWatch)
+Documentation=https://github.com/Big-Zee/Hostwatch
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# simple, not oneshot: multi-user.target must not wait for Slack retries.
+Type=simple
+ExecStart=/usr/local/bin/hostwatch boot
+SyslogIdentifier=hostwatch
+TimeoutStopSec=5
+# Writable /var/lib/hostwatch for the clean-shutdown marker.
+StateDirectory=hostwatch
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

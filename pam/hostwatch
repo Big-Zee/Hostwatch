@@ -1,0 +1,7 @@
+Name: Slack notification on user login (HostWatch)
+Default: yes
+Priority: 0
+Session-Type: Additional
+Session-Interactive-Only: yes
+Session:
+	optional	pam_exec.so quiet /usr/local/bin/hostwatch login
