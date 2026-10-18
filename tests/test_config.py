@@ -59,6 +59,25 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(config.ConfigError, setting):
                 config.heartbeat_settings(cfg)
 
+    def test_login_defaults(self):
+        cfg = config.load(self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n"))
+        self.assertEqual(config.login_settings(cfg), (frozenset(), 30))
+        example = config.load(REPO_EXAMPLE, require_webhook=False)
+        self.assertEqual(config.login_settings(example), (frozenset(), 30))
+
+    def test_login_values(self):
+        cfg = config.load(self.write(
+            f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = Backup, ansible,, \n"
+            "cooldown_seconds = 0\n"))
+        self.assertEqual(config.login_settings(cfg), (frozenset({"backup", "ansible"}), 0))
+
+    def test_invalid_login_settings(self):
+        for line in ("cooldown_seconds = -1", "cooldown_seconds = never", "cooldown_seconds = 7.5"):
+            path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\n{line}\n")
+            cfg = config.load(path)  # loading still works: boot/heartbeat are unaffected
+            with self.assertRaisesRegex(config.ConfigError, "cooldown_seconds"):
+                config.login_settings(cfg)
+
     def test_example_leaves_machine_name_unset(self):
         self.assertEqual(config.load(REPO_EXAMPLE, require_webhook=False).machine_name, "")
 
@@ -162,6 +181,59 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(config.ConfigError) as ctx:
             config.load(path)
         self.assertNotIn(WEBHOOK, str(ctx.exception))
+
+
+class MaskWebhookTest(unittest.TestCase):
+    def test_scheme_host_and_last_four(self):
+        masked = config.mask_webhook("https://hooks.slack.com/services/T000/B000/xyzabcd")
+        self.assertEqual(masked, "https://hooks.slack.com/…abcd")
+        for secret in ("T000", "B000", "xyzab"):
+            self.assertNotIn(secret, masked)
+
+    def test_not_set(self):
+        for url in ("", "   ", None, config.PLACEHOLDER_WEBHOOK):
+            self.assertEqual(config.mask_webhook(url), "not set")
+
+    def test_without_host(self):
+        for url in ("hooks.slack.com/services/T000/B000/xyzabcd", "https:///T000/xyzabcd",
+                    "https://[T000/xyzabcd"):
+            masked = config.mask_webhook(url)
+            self.assertEqual(masked, "…abcd")
+            self.assertNotIn("T000", masked)
+
+    def test_short_value(self):
+        self.assertEqual(config.mask_webhook("https:/"), "…ps:/")
+
+
+class MissingSettingsTest(ConfigTest):
+    def test_old_config_without_heartbeat(self):
+        path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[boot]\nskip_interfaces = docker\n"
+                          "include_ipv6 = false\n[display]\ntimezone = local\n")
+        self.assertEqual(config.missing_settings(path, REPO_EXAMPLE), [
+            ("heartbeat", "enabled", "true"),
+            ("heartbeat", "interval_minutes", "60"),
+            ("login", "cooldown_seconds", "30"),
+        ])
+
+    def test_complete_config_reports_nothing(self):
+        self.assertEqual(config.missing_settings(REPO_EXAMPLE, REPO_EXAMPLE), [])
+
+    def test_commented_machine_name_never_reported(self):
+        path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n")
+        keys = [key for _section, key, _default in config.missing_settings(path, REPO_EXAMPLE)]
+        self.assertNotIn("machine_name", keys)
+        self.assertIn("timezone", keys)
+
+    def test_defaults_come_from_code(self):
+        path = self.write("[display]\ntimezone = local\n")
+        missing = {(s, k): d for s, k, d in config.missing_settings(path, REPO_EXAMPLE)}
+        self.assertEqual(missing[("boot", "skip_interfaces")],
+                         ",".join(config.DEFAULT_SKIP_INTERFACES))
+        self.assertEqual(missing[("slack", "webhook_url")], "none, required")
+
+    def test_unreadable_config(self):
+        with self.assertRaises(config.ConfigError):
+            config.missing_settings("/nonexistent/config.ini", REPO_EXAMPLE)
 
 
 if __name__ == "__main__":

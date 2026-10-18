@@ -53,5 +53,51 @@ class ChooseLibTest(unittest.TestCase):
         self.assertEqual(self.wrapper.INSTALLED_LIB, "/usr/local/lib/hostwatch")
 
 
+class SanitizePamEnvironmentTest(unittest.TestCase):
+    def setUp(self):
+        self.wrapper = load_wrapper()
+
+    def test_noop_without_pam_type(self):
+        environ = {"PATH": "/home/alice/bin:/usr/bin", "LD_PRELOAD": "/home/alice/evil.so"}
+        before = dict(environ)
+        self.wrapper.sanitize_pam_environment(environ)
+        self.assertEqual(environ, before)
+
+    def test_strips_everything_but_pam_vars_when_pam_type_set(self):
+        environ = {
+            "PAM_TYPE": "open_session", "PAM_SERVICE": "sshd", "PAM_USER": "alice",
+            "PAM_RHOST": "203.0.113.7", "PAM_TTY": "ssh",
+            "PATH": "/home/alice/bin:/usr/bin",
+            "LD_PRELOAD": "/home/alice/evil.so",
+            "OPENSSL_CONF": "/home/alice/openssl.cnf",
+            "SSL_CERT_FILE": "/home/alice/fake-ca.pem",
+            "https_proxy": "http://attacker.example:8080",
+        }
+        self.wrapper.sanitize_pam_environment(environ)
+        self.assertEqual(environ, {
+            "PAM_TYPE": "open_session", "PAM_SERVICE": "sshd", "PAM_USER": "alice",
+            "PAM_RHOST": "203.0.113.7", "PAM_TTY": "ssh",
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
+        })
+
+    def test_main_skips_sanitizing_on_dry_run(self):
+        with mock.patch.object(self.wrapper, "sanitize_pam_environment") as sanitize, \
+                mock.patch.object(self.wrapper, "choose_lib", return_value=REPO + "/src"), \
+                mock.patch("hostwatch.cli.main", return_value=0):
+            code = self.wrapper.main(["hostwatch", "login", "--dry-run"], {"PAM_TYPE": "open_session"})
+        self.assertEqual(code, 0)
+        sanitize.assert_not_called()
+
+    def test_main_sanitizes_outside_dry_run(self):
+        environ = {"PAM_TYPE": "open_session", "PATH": "/home/alice/bin",
+                   "LD_PRELOAD": "/home/alice/evil.so"}
+        with mock.patch.object(self.wrapper, "choose_lib", return_value=REPO + "/src"), \
+                mock.patch("hostwatch.cli.main", return_value=0):
+            code = self.wrapper.main(["hostwatch", "login"], environ)
+        self.assertEqual(code, 0)
+        self.assertEqual(environ["PATH"], "/usr/sbin:/usr/bin:/sbin:/bin")
+        self.assertNotIn("LD_PRELOAD", environ)
+
+
 if __name__ == "__main__":
     unittest.main()

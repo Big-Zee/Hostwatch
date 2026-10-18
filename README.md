@@ -28,14 +28,16 @@ The only network request HostWatch makes is the message to Slack. It is plain Py
    sudo ./install.sh
    ```
 
-   The script asks for the webhook URL; the input is hidden. Leave it empty to edit the config later. To pass the URL without a prompt (for example from a script), put it in the environment instead:
+   The script asks for the webhook URL; the input is hidden. Leave it empty to edit the config later. It must start with `https://hooks.slack.com/`. A URL that doesn't, or that contains spaces (such as one followed by a `# comment`), is refused without being shown, and the placeholder is kept. Then it asks for an optional machine name (see [Using HostWatch on several machines](#using-hostwatch-on-several-machines)); press Enter to show the hostname alone.
+
+   To pass the URL without a prompt (for example from a script), put it in the environment instead:
 
    ```bash
    read -rs SLACK_WEBHOOK_URL && export SLACK_WEBHOOK_URL
    sudo --preserve-env=SLACK_WEBHOOK_URL ./install.sh
    ```
 
-   Don't type the URL as part of a command (for example as a `VAR=value` prefix to `sudo`): shell history, process listings (`ps`) and sudo's log would all record the secret. A URL containing spaces, such as one followed by a `# comment`, is refused and the placeholder is kept.
+   Don't type the URL as part of a command (for example as a `VAR=value` prefix to `sudo`): shell history, process listings (`ps`) and sudo's log would all record the secret. The installer never prints the full URL.
 3. Check it works:
 
    ```bash
@@ -51,9 +53,44 @@ The only network request HostWatch makes is the message to Slack. It is plain Py
 - installs `hostwatch-heartbeat.timer` / `.service`, applies `[heartbeat] interval_minutes` to the timer, and starts it
 - on first install, creates `/var/lib/hostwatch/` and records a clean state, so the first boot shows no unclean-shutdown warning
 - adds the login hook with `pam-auth-update` and checks that it is in `/etc/pam.d/common-session`
-- creates `/etc/hostwatch/config.ini` (root, mode `600`) from `config.example.ini`
+- creates `/etc/hostwatch/config.ini` (root, mode `600`) from `config.example.ini`, or shows the existing one and asks whether to keep it (see below)
+- checks that the heartbeat timer has a next run, and warns if not
 
-Running it again updates the program and keeps your config. It also resets the config to `root:root`, mode `600`, if that was changed, and leaves the clean-shutdown record alone.
+### Running it again (upgrades)
+
+Run `sudo ./install.sh` again to upgrade. It updates the program and doesn't ask for the webhook again. It shows the configuration it found, with the webhook masked to its host and last 4 characters, and asks for one confirmation:
+
+```
+Existing HostWatch configuration found:
+  webhook URL  : https://hooks.slack.com/…abcd
+  machine_name : Maja PC
+  heartbeat    : enabled, every 60 min
+Use this configuration? [Y/n]
+```
+
+- **Y or Enter** keeps `/etc/hostwatch/config.ini` exactly as it is.
+- **n** asks for a new webhook URL (hidden input, same rules as above). Before writing it, the installer saves the previous file as `/etc/hostwatch/config.ini.bak` (root, mode `600`). Every other setting is kept. Leaving the new URL empty, or entering an invalid one, changes nothing.
+
+If a newer version supports settings your file doesn't have, the installer lists them with the default it uses. It doesn't add them to your file.
+
+Options:
+
+| Option | Effect |
+|---|---|
+| `--yes` | Keep the existing config without asking. For scripted upgrades. |
+| `--reconfigure` | Always ask for a new webhook, as if you had answered **n**. The previous file is saved as `config.ini.bak`. |
+| `-h`, `--help` | Show the options. |
+
+Without a terminal (for example when run from a script), the existing config is kept without asking, as with `--yes`. `SLACK_WEBHOOK_URL` is used for a first install and with `--reconfigure`. On a re-run without `--reconfigure` it is ignored, and the installer says so. To replace the webhook from a script:
+
+```bash
+read -rs SLACK_WEBHOOK_URL && export SLACK_WEBHOOK_URL
+sudo --preserve-env=SLACK_WEBHOOK_URL ./install.sh --reconfigure
+```
+
+`--reconfigure` with neither a terminal nor `SLACK_WEBHOOK_URL` stops with an error before changing anything.
+
+A re-run also resets the config to `root:root`, mode `600`, if that was changed, and leaves the clean-shutdown record alone. Re-running with the same answers leaves the config unchanged.
 
 **If `install.sh` says the login hook is not active:** `/etc/pam.d/common-session` was edited by hand, and `pam-auth-update` does not change a hand-edited file. Everything else is installed. Add this line to that file yourself:
 
@@ -75,7 +112,9 @@ The config file is `/etc/hostwatch/config.ini`. It holds the webhook secret, so 
 | `[display]` | `timezone` | `local` | `local` or an IANA name such as `Europe/Warsaw` |
 | `[display]` | `machine_name` | *(unset)* | Optional friendly name, shown as `Office PC (office-pc)`; unset means hostname only |
 | `[heartbeat]` | `enabled` | `true` | `false` stops heartbeats without uninstalling (takes effect at the next run) |
-| `[heartbeat]` | `interval_minutes` | `60` | Minutes between heartbeats, counted from boot (5–1440); run `install.sh` again after changing it |
+| `[heartbeat]` | `interval_minutes` | `60` | Minutes between heartbeats (5–1440), the first one interval after boot; run `install.sh` again after changing it |
+| `[login]` | `ignore_users` | *(unset)* | Comma-separated PAM usernames never announced as a login, e.g. automation or service accounts |
+| `[login]` | `cooldown_seconds` | `30` | Collapses repeated SSH login notifications for the same user and remote host into at most one per this many seconds (`0` disables it); `sshd` opens a PAM session for every connection, not only interactive ones, so `scp`/`rsync`/`git`-over-SSH/Ansible can each otherwise post one |
 
 Changes take effect at the next boot, shutdown or login. There is no daemon to restart.
 
@@ -122,8 +161,9 @@ Top processes (CPU over 1 s, % of one core)
     911 root       2.0   0.4  Xorg
 ```
 
-- **Schedule.** The schedule counts from boot, not the clock: the first heartbeat comes one interval after boot, then one every interval. The interval is `[heartbeat] interval_minutes` (default 60). `install.sh` writes it into a drop-in at `/etc/systemd/system/hostwatch-heartbeat.timer.d/interval.conf`. On a first install, a host that has already been up longer than one interval sends one heartbeat right away.
-- **Changing the interval.** Run `sudo ./install.sh` again after editing it. If the machine has been up longer than the new interval, systemd sends one heartbeat right away. A re-run with an unchanged interval sends nothing.
+- **Schedule.** The schedule counts from boot, not the clock: the first heartbeat comes one interval after boot, then one every interval, with no manual step after a reboot. The interval is `[heartbeat] interval_minutes` (default 60). `install.sh` writes it into a drop-in at `/etc/systemd/system/hostwatch-heartbeat.timer.d/interval.conf`, then checks that the timer has a next run (`systemctl list-timers hostwatch-heartbeat.timer`) and warns if not. Installing never sends a heartbeat by itself: after a first install, the first heartbeat comes one interval later, however long the host has been up.
+- **Changing the interval.** Run `sudo ./install.sh` again after editing it. The next heartbeat comes one new interval after the install. A re-run with an unchanged interval sends nothing and keeps the current schedule.
+- **Upgrading from an earlier version.** Earlier versions wrote a drop-in that left the timer without a first run after boot, so heartbeats only started after the service was started by hand. Run `sudo ./install.sh` on each host to rewrite it.
 - **Turning it off.** Set `enabled = false`. It takes effect at the next run, with no reinstall. Boot, login and shutdown messages keep working.
 - **Top processes.** HostWatch reads `/proc` twice, one second apart, so the table shows CPU use *now* (a single `ps` reading is a lifetime average).
   - CPU % is relative to one core, as in `top`, so it can go above 100 on multi-core PCs.
@@ -216,13 +256,17 @@ Common log messages:
 - `heartbeat: disabled in config, skipping`: `[heartbeat] enabled = false`.
 - `[heartbeat] interval_minutes must be a whole number from 5 to 1440`: fix the value. `install.sh` refuses to continue until it is valid.
 
+- `login: user USER is in [login] ignore_users, skipping`: expected; add or remove the name in `[login] ignore_users` to change it.
+- `login: user USER (SSH) notified recently, skipping`: another SSH login (or `scp`/`rsync`/Ansible) for the same user and remote host arrived within `[login] cooldown_seconds`.
+- `[login] cooldown_seconds must be a whole number >= 0`: fix the value; logins are still announced in the meantime, without the cooldown.
+
 At boot, the service retries for up to about 2.5 minutes in the background. At shutdown and for heartbeats, it tries once.
 
 ## Uninstall
 
 ```bash
 sudo ./uninstall.sh            # keeps /etc/hostwatch; removes /var/lib/hostwatch
-sudo ./uninstall.sh --purge    # also removes the config
+sudo ./uninstall.sh --purge    # also removes the config and config.ini.bak
 ```
 
 ## Development

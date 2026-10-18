@@ -3,10 +3,19 @@ import argparse
 import json
 import os
 import signal
+import sys
 
 from . import config, log, messages, netinfo, processes, sessions, slack, state, timefmt
 
 LOGIN_DEADLINE = 60  # seconds the detached login sender may live
+
+HEARTBEAT_TIMER_UNIT = "hostwatch-heartbeat.timer"
+# OnUnitActiveSec/OnActiveSec count from when the timer last (re)started, so a
+# restart that shortens the interval (install.sh --reconfigure, or an admin
+# running it by hand) can make systemd fire immediately. The shortest valid
+# interval is 5 minutes, so a run this soon after the timer started is never
+# a genuine tick.
+HEARTBEAT_START_GRACE = 60
 
 # PAM service -> login type. Anything not listed (su, sudo, cron, systemd-user,
 # gdm-launch-environment, ...) is ignored.
@@ -127,6 +136,10 @@ def run_heartbeat(args):
         if not enabled:
             log.info("heartbeat: disabled in config, skipping")
             return 0
+        if not getattr(args, "dry_run", False) and netinfo.timer_recently_started(
+                HEARTBEAT_TIMER_UNIT, HEARTBEAT_START_GRACE):
+            log.info("heartbeat: timer just (re)started, skipping this run")
+            return 0
         uptime = timefmt.uptime_seconds()
         boot_time = timefmt.kernel_boot_time()
         top = processes.top_processes()  # samples for ~1 s
@@ -155,6 +168,40 @@ def run_heartbeat_interval(args):
         log.error(str(exc))
         return 1
     return 0
+
+
+def run_config_summary(args):
+    """Admin helper for install.sh: the existing config as it may be shown.
+
+    Prints ``key=value`` lines: the masked webhook, the machine name, the
+    heartbeat setting and one ``missing=`` line per setting the file lacks.
+    The full webhook is never printed or logged.
+    """
+    try:
+        path = getattr(args, "config", None) or config.DEFAULT_PATH
+        cfg = config.load(path, require_webhook=False)
+        missing = config.missing_settings(path, args.example)
+    except config.ConfigError as exc:
+        log.error(str(exc))
+        return 1
+    try:
+        enabled, interval = config.heartbeat_settings(cfg)
+        heartbeat = f"enabled, every {interval} min" if enabled else "disabled"
+    except config.ConfigError as exc:
+        heartbeat = f"invalid ({exc})"
+    lines = [
+        f"webhook={config.mask_webhook(cfg.webhook_url)}",
+        f"machine_name={_printable(cfg.machine_name) or 'not set (hostname only)'}",
+        f"heartbeat={heartbeat}",
+    ] + [f"missing=[{section}] {key} (default: {default})" for section, key, default in missing]
+    if hasattr(sys.stdout, "reconfigure"):  # "…" on a non-UTF-8 terminal
+        sys.stdout.reconfigure(errors="backslashreplace")
+    print("\n".join(lines))
+    return 0
+
+
+def _printable(text):
+    return "".join(c if c.isprintable() else "?" for c in text)
 
 
 def run_shutdown(args):
@@ -231,18 +278,34 @@ def run_login(args, environ=None, detach=None, wait=None):
         # $HOSTWATCH_CONFIG is ignored; dry runs and --config still work.
         cfg = _load_config(args, "login", None if dry_run else config.DEFAULT_PATH)
         if cfg is not None:
-            if not dry_run:
-                # pam_systemd may register this session after our hook started;
-                # give logind a moment so the new session shows under Users.
-                wait(user, rhost if kind == "SSH" else None)
-            time_str = timefmt.format_time(moment, cfg.timezone)
+            try:
+                ignore_users, cooldown = config.login_settings(cfg)
+            except config.ConfigError as exc:
+                log.error(f"login: {exc}; ignoring [login] settings for this run")
+                ignore_users, cooldown = frozenset(), 0
+            skip = user.lower() in ignore_users
+            if skip:
+                log.info(f"login: user {user} is in [login] ignore_users, skipping")
+            # sshd opens a session for every connection, interactive or not, so
+            # scp/rsync/git-over-ssh/Ansible can each look like a login; collapse
+            # a burst for the same user and remote host into one notification.
+            elif (not dry_run and kind == "SSH"
+                    and state.login_recently_notified(f"{user}:{kind}:{rhost}", cooldown)):
+                skip = True
+                log.info(f"login: user {user} ({kind}) notified recently, skipping")
+            if not skip:
+                if not dry_run:
+                    # pam_systemd may register this session after our hook started;
+                    # give logind a moment so the new session shows under Users.
+                    wait(user, rhost if kind == "SSH" else None)
+                time_str = timefmt.format_time(moment, cfg.timezone)
 
-            def build():
-                machine, ips, users = _identity(cfg)
-                return messages.login_message(machine, user, kind, time_str, ips, users,
-                                              tty=tty, rhost=rhost)
+                def build():
+                    machine, ips, users = _identity(cfg)
+                    return messages.login_message(machine, user, kind, time_str, ips, users,
+                                                  tty=tty, rhost=rhost)
 
-            _deliver(args, cfg, build, slack.LOGIN_DELAYS, f"login ({user}, {kind})")
+                _deliver(args, cfg, build, slack.LOGIN_DELAYS, f"login ({user}, {kind})")
     except Exception as exc:  # never let a bug surface in the login path
         _log_unexpected("login", exc)
     if detached:
@@ -282,12 +345,15 @@ def build_parser():
     sub.add_parser("login", parents=[common], help="send a login notification (pam_exec hook)")
     sub.add_parser("test", parents=[common], help="send a test message; exit 1 if it fails")
     sub.add_parser("heartbeat-interval", parents=[common])  # hidden: used by install.sh
+    summary = sub.add_parser("config-summary", parents=[common])  # hidden: used by install.sh
+    summary.add_argument("--example", required=True)
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     handlers = {"boot": run_boot, "shutdown": run_shutdown, "heartbeat": run_heartbeat,
-                "heartbeat-interval": run_heartbeat_interval, "login": run_login,
+                "heartbeat-interval": run_heartbeat_interval,
+                "config-summary": run_config_summary, "login": run_login,
                 "test": run_test}
     return handlers[args.command](args)

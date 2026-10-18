@@ -15,6 +15,7 @@ DEFAULT_SKIP_INTERFACES = (
 )
 DEFAULT_HEARTBEAT_INTERVAL = 60
 HEARTBEAT_INTERVAL_RANGE = (5, 1440)
+DEFAULT_LOGIN_COOLDOWN = 30
 
 
 class ConfigError(Exception):
@@ -32,6 +33,10 @@ class Config:
     # there cannot silence boot, login or shutdown messages.
     heartbeat_enabled: str = "true"
     heartbeat_interval: str = str(DEFAULT_HEARTBEAT_INTERVAL)
+    # Raw [login] values; validated only by login_settings(), so a typo there
+    # cannot silence login notifications outright.
+    login_ignore_users: str = ""
+    login_cooldown: str = str(DEFAULT_LOGIN_COOLDOWN)
 
 
 def resolve_path(explicit=None):
@@ -45,18 +50,7 @@ def load(path=None, require_webhook=True):
     is accepted; every other setting is still validated.
     """
     path = resolve_path(path)
-    parser = configparser.ConfigParser(interpolation=None)
-    try:
-        # utf-8-sig drops the byte-order mark some Windows editors write.
-        with open(path, encoding="utf-8-sig") as fh:
-            parser.read_file(fh)
-    except OSError as exc:
-        raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from None
-    except UnicodeDecodeError:
-        raise ConfigError(f"config {path} is not valid UTF-8") from None
-    except configparser.Error:
-        # The parser's message can quote the offending line, which may be the webhook.
-        raise ConfigError(f"invalid syntax in config {path}") from None
+    parser = _read(path)
 
     try:
         include_ipv6 = parser.getboolean("boot", "include_ipv6", fallback=False)
@@ -78,9 +72,73 @@ def load(path=None, require_webhook=True):
         heartbeat_enabled=parser.get("heartbeat", "enabled", fallback="true").strip(),
         heartbeat_interval=parser.get("heartbeat", "interval_minutes",
                                       fallback=str(DEFAULT_HEARTBEAT_INTERVAL)).strip(),
+        login_ignore_users=parser.get("login", "ignore_users", fallback="").strip(),
+        login_cooldown=parser.get("login", "cooldown_seconds",
+                                  fallback=str(DEFAULT_LOGIN_COOLDOWN)).strip(),
     )
     validate(cfg, require_webhook)
     return cfg
+
+
+def _read(path):
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        # utf-8-sig drops the byte-order mark some Windows editors write.
+        with open(path, encoding="utf-8-sig") as fh:
+            parser.read_file(fh)
+    except OSError as exc:
+        raise ConfigError(f"cannot read config {path}: {exc.strerror or exc}") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"config {path} is not valid UTF-8") from None
+    except configparser.Error:
+        # The parser's message can quote the offending line, which may be the webhook.
+        raise ConfigError(f"invalid syntax in config {path}") from None
+    return parser
+
+
+def mask_webhook(url):
+    """The webhook as it may be shown: scheme and host, then the last 4 characters.
+
+    Used by install.sh, so the full secret never reaches a terminal or a log.
+    """
+    url = (url or "").strip()
+    if not url or url == PLACEHOLDER_WEBHOOK:
+        return "not set"
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        host = None
+    if host and parts.scheme and len(url) >= 8:
+        return f"{parts.scheme}://{host}/…{url[-4:]}"
+    return f"…{url[-4:]}"
+
+
+# Defaults reported for settings missing from an existing config.
+_DEFAULTS = {
+    ("slack", "webhook_url"): "none, required",
+    ("boot", "skip_interfaces"): ",".join(DEFAULT_SKIP_INTERFACES),
+    ("boot", "include_ipv6"): "false",
+    ("display", "timezone"): "local",
+    ("heartbeat", "enabled"): "true",
+    ("heartbeat", "interval_minutes"): str(DEFAULT_HEARTBEAT_INTERVAL),
+    ("login", "cooldown_seconds"): str(DEFAULT_LOGIN_COOLDOWN),
+}
+
+
+def missing_settings(path, example_path):
+    """(section, key, default) for each setting in the example that the config lacks.
+
+    Only uncommented example settings count, so optional ones such as
+    machine_name are never reported. The config file itself is not changed.
+    """
+    have, example = _read(path), _read(example_path)
+    return [
+        (section, key, _DEFAULTS.get((section, key), example.get(section, key)))
+        for section in example.sections()
+        for key in example[section]
+        if not have.has_option(section, key)
+    ]
 
 
 def heartbeat_settings(cfg):
@@ -97,6 +155,24 @@ def heartbeat_settings(cfg):
         raise ConfigError(f"[heartbeat] interval_minutes must be a whole number from {low} to "
                           f"{high}, got {cfg.heartbeat_interval!r}")
     return enabled, interval
+
+
+def login_settings(cfg):
+    """Return (ignore_users, cooldown_seconds), or raise ConfigError naming the bad setting.
+
+    ``ignore_users`` is a frozenset of lower-cased PAM usernames.
+    """
+    ignore_users = frozenset(
+        u.strip().lower() for u in cfg.login_ignore_users.split(",") if u.strip()
+    )
+    try:
+        cooldown = int(cfg.login_cooldown)
+    except ValueError:
+        cooldown = None
+    if cooldown is None or cooldown < 0:
+        raise ConfigError(f"[login] cooldown_seconds must be a whole number >= 0, "
+                          f"got {cfg.login_cooldown!r}")
+    return ignore_users, cooldown
 
 
 def _well_formed(url):

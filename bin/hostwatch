@@ -11,6 +11,39 @@ import sys
 INSTALLED_BIN = "/usr/local/bin/hostwatch"
 INSTALLED_LIB = "/usr/local/lib/hostwatch"
 
+# Kept beyond PAM_*: commands are looked up on PATH, and a consistent LANG
+# keeps command output in the plain-ASCII form the parsers expect.
+SANITIZED_ENV_EXTRA = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+
+
+def sanitize_pam_environment(environ):
+    """Replace a PAM-assembled environment with only what the hook needs.
+
+    pam_exec runs this hook as root with whatever environment PAM put
+    together for the login, which on some PAM configurations is partly
+    controlled by the user's own ~/.pam_environment (user_readenv=1 run
+    before common-session). Left alone, that lets the user set PATH (so a
+    command this hook runs by bare name resolves to the user's own binary,
+    as root), LD_PRELOAD, or OPENSSL_CONF/SSL_CERT_FILE/https_proxy (which
+    together let them see or redirect the HTTPS call that carries the
+    webhook). Keeping only PAM_* plus a fixed PATH and LANG removes all of
+    that while leaving every PAM_* value (service, user, tty, remote host)
+    this hook actually reads untouched.
+
+    No-op when PAM_TYPE is absent: that means this is not a real pam_exec
+    invocation (boot/shutdown/heartbeat units, or a manual run), and the
+    caller's own environment should be left alone. The caller also skips
+    this for --dry-run, so README's manual test
+    (``PAM_TYPE=... hostwatch login --dry-run``) still runs with the
+    developer's own environment.
+    """
+    if "PAM_TYPE" not in environ:
+        return
+    kept = {k: v for k, v in environ.items() if k.startswith("PAM_")}
+    kept.update(SANITIZED_ENV_EXTRA)
+    environ.clear()
+    environ.update(kept)
+
 
 def choose_lib(real_path):
     """Return the directory to import the hostwatch package from.
@@ -26,9 +59,16 @@ def choose_lib(real_path):
     return INSTALLED_LIB
 
 
-if __name__ == "__main__":
+def main(argv, environ):
+    if "--dry-run" not in argv:
+        sanitize_pam_environment(environ)
+
     sys.path.insert(0, choose_lib(os.path.realpath(__file__)))
 
     from hostwatch import cli  # noqa: E402
 
-    sys.exit(cli.main())
+    return cli.main()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv, os.environ))

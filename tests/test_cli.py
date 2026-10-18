@@ -23,6 +23,9 @@ def setUpModule():
         mock.patch.dict(os.environ, {state.STATE_DIR_ENV: state_dir}),
         mock.patch.object(cli.sessions, "logged_in_users", return_value=[]),
         mock.patch.object(cli.sessions, "wait_for_session", return_value=True),
+        # Individual tests reuse the same user/host across calls; the login
+        # cooldown is exercised explicitly by its own tests instead.
+        mock.patch.object(cli.state, "login_recently_notified", return_value=False),
     ]
     for p in _patches:
         p.start()
@@ -297,6 +300,59 @@ class LoginConfigPathTest(unittest.TestCase):
             code, out = run(["login", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(out)["text"].startswith("Test Box (my-pc) · alice logged in"))
+
+
+@mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
+@mock.patch.object(cli.netinfo, "local_addresses", return_value=[])
+class LoginFilterTest(unittest.TestCase):
+    ENV = {"PAM_TYPE": "open_session", "PAM_SERVICE": "sshd", "PAM_USER": "alice",
+           "PAM_RHOST": "203.0.113.7"}
+
+    def login(self, config_text, environ=None, **kw):
+        fd, path = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(config_text)
+        self.addCleanup(os.remove, path)
+        args = cli.build_parser().parse_args(["login", "--config", path])
+        with mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.run_login(args, environ=environ or self.ENV, detach=lambda: True,
+                                           wait=mock.Mock(), **kw), 0)
+        return post
+
+    def test_ignored_user_is_not_announced(self, *_):
+        post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = alice\n")
+        post.assert_not_called()
+
+    def test_ignore_users_is_case_insensitive(self, *_):
+        post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = Alice\n")
+        post.assert_not_called()
+
+    def test_other_user_still_announced(self, *_):
+        post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = bob\n")
+        post.assert_called_once()
+
+    def test_cooldown_skips_repeat_ssh_login(self, *_):
+        with mock.patch.object(cli.state, "login_recently_notified", return_value=True):
+            post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n")
+        post.assert_not_called()
+
+    def test_cooldown_not_applied_to_other_login_kinds(self, *_):
+        env = dict(self.ENV, PAM_SERVICE="login", PAM_RHOST="")
+        with mock.patch.object(cli.state, "login_recently_notified", return_value=True):
+            post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n", environ=env)
+        post.assert_called_once()
+
+    def test_cooldown_key_includes_user_kind_and_remote(self, *_):
+        with mock.patch.object(cli.state, "login_recently_notified", return_value=False) as recently:
+            self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n")
+        recently.assert_called_once_with("alice:SSH:203.0.113.7", 30)
+
+    def test_invalid_login_settings_logged_and_fail_open(self, *_):
+        with mock.patch.object(cli.log, "error") as error:
+            post = self.login(
+                f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\ncooldown_seconds = bogus\n")
+        post.assert_called_once()
+        error.assert_called_once()
 
 
 def write_config():
@@ -594,6 +650,23 @@ class HeartbeatCommandTest(unittest.TestCase):
         post.assert_not_called()
         self.assertIn("interval_minutes", error.call_args.args[0])
 
+    @mock.patch.object(cli.log, "info")
+    def test_skips_right_after_timer_restart(self, info, *_):
+        with mock.patch.object(cli.netinfo, "timer_recently_started", return_value=True), \
+                mock.patch.object(cli.slack, "post") as post:
+            self.assertEqual(cli.main(["heartbeat", "--config", self.config()]), 0)
+        post.assert_not_called()
+        info.assert_called_with("heartbeat: timer just (re)started, skipping this run")
+
+    def test_dry_run_ignores_timer_restart_guard(self, *_):
+        with mock.patch.object(cli.netinfo, "timer_recently_started", return_value=True) as guard, \
+                mock.patch.object(cli.netinfo, "local_addresses", return_value=[]), \
+                mock.patch.object(cli.slack, "post") as post:
+            code, _out = run(["heartbeat", "--dry-run", "--config", EXAMPLE])
+        self.assertEqual(code, 0)
+        guard.assert_not_called()
+        post.assert_not_called()  # dry runs never post regardless
+
     def test_failed_delivery_exits_zero(self, *_):
         with mock.patch.object(cli.netinfo, "local_addresses", return_value=[]), \
                 mock.patch.object(cli.slack, "post", return_value=False):
@@ -635,6 +708,69 @@ class HeartbeatCommandTest(unittest.TestCase):
         helptext = cli.build_parser().format_help()
         self.assertIn("heartbeat", helptext)
         self.assertNotIn("heartbeat-interval", helptext)
+
+
+class ConfigSummaryTest(unittest.TestCase):
+    SECRET_HOOK = "https://hooks.slack.com/services/T000/B000/SECRETxyzabcd"
+
+    def config(self, text):
+        fd, path = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def summary(self, path):
+        err = io.StringIO()
+        with mock.patch.object(cli.log, "error") as error, \
+                mock.patch.object(cli.log, "info") as info, contextlib.redirect_stderr(err):
+            code, out = run(["config-summary", "--config", path, "--example", EXAMPLE])
+        logged = str(error.call_args_list) + str(info.call_args_list)
+        return code, out, err.getvalue(), logged
+
+    def test_masked_summary(self):
+        path = self.config(f"[slack]\nwebhook_url = {self.SECRET_HOOK}\n"
+                           "[display]\nmachine_name = Maja PC\n")
+        code, out, err, logged = self.summary(path)
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertEqual(lines[:3], [
+            "webhook=https://hooks.slack.com/…abcd",
+            "machine_name=Maja PC",
+            "heartbeat=enabled, every 60 min",
+        ])
+        self.assertIn("missing=[boot] include_ipv6 (default: false)", lines)
+        for text in (out, err, logged):
+            self.assertNotIn("SECRET", text)
+            self.assertNotIn("T000", text)
+
+    def test_placeholder_and_disabled(self):
+        path = self.config("[slack]\nwebhook_url = https://hooks.slack.com/services/REPLACE/WITH/"
+                           "YOUR-WEBHOOK\n[heartbeat]\nenabled = false\ninterval_minutes = 30\n")
+        code, out, _err, _logged = self.summary(path)
+        self.assertEqual(code, 0)
+        self.assertIn("webhook=not set", out)
+        self.assertIn("machine_name=not set (hostname only)", out)
+        self.assertIn("heartbeat=disabled", out)
+
+    def test_example_has_nothing_missing(self):
+        code, out, _err, _logged = self.summary(EXAMPLE)
+        self.assertEqual(code, 0)
+        self.assertNotIn("missing=", out)
+
+    def test_broken_file_exits_1_without_quoting(self):
+        path = self.config(f"webhook_url = {self.SECRET_HOOK}\n[slack\n")
+        code, out, err, logged = self.summary(path)
+        self.assertEqual((code, out), (1, ""))
+        for text in (err, logged):
+            self.assertNotIn("SECRET", text)
+
+    def test_missing_file_exits_1(self):
+        code, out, _err, _logged = self.summary("/nonexistent/config.ini")
+        self.assertEqual((code, out), (1, ""))
+
+    def test_hidden_from_help(self):
+        self.assertNotIn("config-summary", cli.build_parser().format_help())
 
 
 if __name__ == "__main__":
