@@ -12,7 +12,7 @@ There are four medium findings: one security exposure that depends on the host's
 
 Suggested fix order: #8 and #9, then #1, then #2.
 
-**Update:** #8 and #9 are fixed (see "Fixed" notes under each). #1 and #2 are still open.
+**Update:** #8, #9 and #1 are fixed (see "Fixed" notes under each). #2 is still open.
 
 | # | Severity | Area | Finding |
 |---|---|---|---|
@@ -46,6 +46,7 @@ Suggested fix order: #8 and #9, then #1, then #2.
   - In `bin/hostwatch`, before any import, when `PAM_TYPE` is set and this is not a dry run, replace `os.environ` with only the `PAM_*` variables plus `PATH=/usr/sbin:/usr/bin:/sbin:/bin` and `LANG=C.UTF-8`. This must happen before `cli` imports `ssl`.
   - Call the commands by absolute path (finding #11 of the first review, deferred).
   - `LD_PRELOAD` on `python3` itself cannot be fixed inside Python. Have `install.sh` warn when `grep -n 'user_readenv=1\|common-session' /etc/pam.d/{sshd,login,gdm-*,lightdm*,sddm*}` shows `user_readenv=1` before the include.
+- **Fixed:** `bin/hostwatch` has `sanitize_pam_environment()`, called from `main()` whenever `PAM_TYPE` is in the environment and `--dry-run` was not passed (so the README's manual dry-run test still uses the developer's own environment). It runs before `from hostwatch import cli`, i.e. before anything imports `ssl`, and replaces the environment with only the `PAM_*` variables plus `PATH=/usr/sbin:/usr/bin:/sbin:/bin` and `LANG=C.UTF-8`. `install.sh` has `check_pam_env_order`, run after enabling the login hook: for each service HostWatch announces (`LOGIN_PAM_SERVICES`, mirroring `cli.LOGIN_SERVICES`) it warns, without failing the install, if that service's PAM file runs `pam_env.so user_readenv=1` before `@include common-session`. `LD_PRELOAD` on `python3` itself is still unfixable from inside Python, which is why this stays a warning, not a block. Not checked on a VM yet.
 
 ### 2. Medium: every non-interactive SSH connection is announced as a login
 

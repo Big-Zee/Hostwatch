@@ -68,6 +68,9 @@ CONF="$CONF_DIR/config.ini"
 STATE_DIR=/var/lib/hostwatch
 PAM_SESSION=/etc/pam.d/common-session
 PAM_HOOK_RE='pam_exec\.so.*/usr/local/bin/hostwatch login'
+# The services hostwatch login announces (see LOGIN_SERVICES in cli.py).
+LOGIN_PAM_SERVICES=(sshd login gdm-password gdm-autologin gdm-fingerprint gdm-smartcard
+                     lightdm lightdm-autologin sddm sddm-autologin)
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -83,6 +86,32 @@ check_webhook() {
             "for example an inline comment) - $2" >&2
         return 1
     fi
+}
+
+# Warn if any login service runs pam_env with user_readenv=1 before including
+# common-session: on such a host the login hook runs with an environment the
+# logging-in user partly controls through ~/.pam_environment (PATH,
+# LD_PRELOAD, OPENSSL_CONF/SSL_CERT_FILE/https_proxy). The hook defends
+# itself (bin/hostwatch sanitizes PAM_TYPE-bearing environments down to
+# PAM_* plus a fixed PATH/LANG before anything else runs), but LD_PRELOAD on
+# python3 itself cannot be fixed from inside Python, so this is still worth
+# the admin's attention. Informational only: never blocks the install.
+check_pam_env_order() {
+    local svc file line_env line_common
+    for svc in "${LOGIN_PAM_SERVICES[@]}"; do
+        file="/etc/pam.d/$svc"
+        [[ -f "$file" ]] || continue
+        line_env="$(grep -n 'pam_env\.so.*user_readenv=1' "$file" | head -1 | cut -d: -f1)" || true
+        line_common="$(grep -n '@include[[:space:]]\+common-session\b' "$file" \
+            | head -1 | cut -d: -f1)" || true
+        if [[ -n "$line_env" && -n "$line_common" && "$line_env" -lt "$line_common" ]]; then
+            echo "install.sh: WARNING: $file runs pam_env with user_readenv=1 before" \
+                "common-session is included. A user logging in through this service can" \
+                "set PATH, LD_PRELOAD or TLS-related variables (OPENSSL_CONF, SSL_CERT_FILE," \
+                "https_proxy) for everything that session's login hooks run, as root." \
+                "See docs/security-review-third.md, finding #1." >&2
+        fi
+    done
 }
 
 # Config edits go through a root-only temporary file next to the config, and
@@ -356,6 +385,7 @@ Everything else is installed: boot, shutdown and heartbeat messages work.
 EOF
     exit 1
 fi
+check_pam_env_order
 
 echo
 echo "Done. Send a test message with:  sudo hostwatch test"
