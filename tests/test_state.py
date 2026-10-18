@@ -50,5 +50,42 @@ class StateTest(unittest.TestCase):
         self.assertFalse(state.peek_clean())
 
 
+class LoginRecentlyNotifiedTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        patcher = mock.patch.dict(os.environ, {state.STATE_DIR_ENV: self.dir})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_first_call_is_not_recent(self):
+        self.assertFalse(state.login_recently_notified("alice:SSH:1.2.3.4", 60))
+
+    def test_second_call_within_window_is_recent(self):
+        state.login_recently_notified("alice:SSH:1.2.3.4", 60)
+        self.assertTrue(state.login_recently_notified("alice:SSH:1.2.3.4", 60))
+
+    def test_different_key_is_independent(self):
+        state.login_recently_notified("alice:SSH:1.2.3.4", 60)
+        self.assertFalse(state.login_recently_notified("bob:SSH:1.2.3.4", 60))
+
+    def test_call_past_the_window_is_not_recent(self):
+        with mock.patch.object(state.time, "time", return_value=1000.0):
+            state.login_recently_notified("alice:SSH:1.2.3.4", 60)
+        with mock.patch.object(state.time, "time", return_value=1061.0):
+            self.assertFalse(state.login_recently_notified("alice:SSH:1.2.3.4", 60))
+
+    def test_zero_window_disables_it(self):
+        state.login_recently_notified("alice:SSH:1.2.3.4", 0)
+        self.assertFalse(state.login_recently_notified("alice:SSH:1.2.3.4", 0))
+
+    @mock.patch.object(state.log, "error")
+    def test_unwritable_dir_is_handled(self, error):
+        marker_parent = os.path.join(self.dir, state.LOGIN_COOLDOWN_DIR)
+        open(marker_parent, "w").close()  # a file where a directory is needed
+        self.assertFalse(state.login_recently_notified("alice:SSH:1.2.3.4", 60))
+        error.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

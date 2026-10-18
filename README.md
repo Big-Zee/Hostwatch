@@ -113,6 +113,8 @@ The config file is `/etc/hostwatch/config.ini`. It holds the webhook secret, so 
 | `[display]` | `machine_name` | *(unset)* | Optional friendly name, shown as `Office PC (office-pc)`; unset means hostname only |
 | `[heartbeat]` | `enabled` | `true` | `false` stops heartbeats without uninstalling (takes effect at the next run) |
 | `[heartbeat]` | `interval_minutes` | `60` | Minutes between heartbeats (5–1440), the first one interval after boot; run `install.sh` again after changing it |
+| `[login]` | `ignore_users` | *(unset)* | Comma-separated PAM usernames never announced as a login, e.g. automation or service accounts |
+| `[login]` | `cooldown_seconds` | `30` | Collapses repeated SSH login notifications for the same user and remote host into at most one per this many seconds (`0` disables it); `sshd` opens a PAM session for every connection, not only interactive ones, so `scp`/`rsync`/`git`-over-SSH/Ansible can each otherwise post one |
 
 Changes take effect at the next boot, shutdown or login. There is no daemon to restart.
 
@@ -253,6 +255,10 @@ Common log messages:
 
 - `heartbeat: disabled in config, skipping`: `[heartbeat] enabled = false`.
 - `[heartbeat] interval_minutes must be a whole number from 5 to 1440`: fix the value. `install.sh` refuses to continue until it is valid.
+
+- `login: user USER is in [login] ignore_users, skipping`: expected; add or remove the name in `[login] ignore_users` to change it.
+- `login: user USER (SSH) notified recently, skipping`: another SSH login (or `scp`/`rsync`/Ansible) for the same user and remote host arrived within `[login] cooldown_seconds`.
+- `[login] cooldown_seconds must be a whole number >= 0`: fix the value; logins are still announced in the meantime, without the cooldown.
 
 At boot, the service retries for up to about 2.5 minutes in the background. At shutdown and for heartbeats, it tries once.
 

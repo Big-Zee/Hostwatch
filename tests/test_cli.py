@@ -23,6 +23,9 @@ def setUpModule():
         mock.patch.dict(os.environ, {state.STATE_DIR_ENV: state_dir}),
         mock.patch.object(cli.sessions, "logged_in_users", return_value=[]),
         mock.patch.object(cli.sessions, "wait_for_session", return_value=True),
+        # Individual tests reuse the same user/host across calls; the login
+        # cooldown is exercised explicitly by its own tests instead.
+        mock.patch.object(cli.state, "login_recently_notified", return_value=False),
     ]
     for p in _patches:
         p.start()
@@ -297,6 +300,59 @@ class LoginConfigPathTest(unittest.TestCase):
             code, out = run(["login", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(out)["text"].startswith("Test Box (my-pc) · alice logged in"))
+
+
+@mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
+@mock.patch.object(cli.netinfo, "local_addresses", return_value=[])
+class LoginFilterTest(unittest.TestCase):
+    ENV = {"PAM_TYPE": "open_session", "PAM_SERVICE": "sshd", "PAM_USER": "alice",
+           "PAM_RHOST": "203.0.113.7"}
+
+    def login(self, config_text, environ=None, **kw):
+        fd, path = tempfile.mkstemp(suffix=".ini")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(config_text)
+        self.addCleanup(os.remove, path)
+        args = cli.build_parser().parse_args(["login", "--config", path])
+        with mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.run_login(args, environ=environ or self.ENV, detach=lambda: True,
+                                           wait=mock.Mock(), **kw), 0)
+        return post
+
+    def test_ignored_user_is_not_announced(self, *_):
+        post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = alice\n")
+        post.assert_not_called()
+
+    def test_ignore_users_is_case_insensitive(self, *_):
+        post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = Alice\n")
+        post.assert_not_called()
+
+    def test_other_user_still_announced(self, *_):
+        post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = bob\n")
+        post.assert_called_once()
+
+    def test_cooldown_skips_repeat_ssh_login(self, *_):
+        with mock.patch.object(cli.state, "login_recently_notified", return_value=True):
+            post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n")
+        post.assert_not_called()
+
+    def test_cooldown_not_applied_to_other_login_kinds(self, *_):
+        env = dict(self.ENV, PAM_SERVICE="login", PAM_RHOST="")
+        with mock.patch.object(cli.state, "login_recently_notified", return_value=True):
+            post = self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n", environ=env)
+        post.assert_called_once()
+
+    def test_cooldown_key_includes_user_kind_and_remote(self, *_):
+        with mock.patch.object(cli.state, "login_recently_notified", return_value=False) as recently:
+            self.login(f"[slack]\nwebhook_url = {WEBHOOK}\n")
+        recently.assert_called_once_with("alice:SSH:203.0.113.7", 30)
+
+    def test_invalid_login_settings_logged_and_fail_open(self, *_):
+        with mock.patch.object(cli.log, "error") as error:
+            post = self.login(
+                f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\ncooldown_seconds = bogus\n")
+        post.assert_called_once()
+        error.assert_called_once()
 
 
 def write_config():

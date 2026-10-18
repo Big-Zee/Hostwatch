@@ -15,6 +15,7 @@ DEFAULT_SKIP_INTERFACES = (
 )
 DEFAULT_HEARTBEAT_INTERVAL = 60
 HEARTBEAT_INTERVAL_RANGE = (5, 1440)
+DEFAULT_LOGIN_COOLDOWN = 30
 
 
 class ConfigError(Exception):
@@ -32,6 +33,10 @@ class Config:
     # there cannot silence boot, login or shutdown messages.
     heartbeat_enabled: str = "true"
     heartbeat_interval: str = str(DEFAULT_HEARTBEAT_INTERVAL)
+    # Raw [login] values; validated only by login_settings(), so a typo there
+    # cannot silence login notifications outright.
+    login_ignore_users: str = ""
+    login_cooldown: str = str(DEFAULT_LOGIN_COOLDOWN)
 
 
 def resolve_path(explicit=None):
@@ -67,6 +72,9 @@ def load(path=None, require_webhook=True):
         heartbeat_enabled=parser.get("heartbeat", "enabled", fallback="true").strip(),
         heartbeat_interval=parser.get("heartbeat", "interval_minutes",
                                       fallback=str(DEFAULT_HEARTBEAT_INTERVAL)).strip(),
+        login_ignore_users=parser.get("login", "ignore_users", fallback="").strip(),
+        login_cooldown=parser.get("login", "cooldown_seconds",
+                                  fallback=str(DEFAULT_LOGIN_COOLDOWN)).strip(),
     )
     validate(cfg, require_webhook)
     return cfg
@@ -114,6 +122,7 @@ _DEFAULTS = {
     ("display", "timezone"): "local",
     ("heartbeat", "enabled"): "true",
     ("heartbeat", "interval_minutes"): str(DEFAULT_HEARTBEAT_INTERVAL),
+    ("login", "cooldown_seconds"): str(DEFAULT_LOGIN_COOLDOWN),
 }
 
 
@@ -146,6 +155,24 @@ def heartbeat_settings(cfg):
         raise ConfigError(f"[heartbeat] interval_minutes must be a whole number from {low} to "
                           f"{high}, got {cfg.heartbeat_interval!r}")
     return enabled, interval
+
+
+def login_settings(cfg):
+    """Return (ignore_users, cooldown_seconds), or raise ConfigError naming the bad setting.
+
+    ``ignore_users`` is a frozenset of lower-cased PAM usernames.
+    """
+    ignore_users = frozenset(
+        u.strip().lower() for u in cfg.login_ignore_users.split(",") if u.strip()
+    )
+    try:
+        cooldown = int(cfg.login_cooldown)
+    except ValueError:
+        cooldown = None
+    if cooldown is None or cooldown < 0:
+        raise ConfigError(f"[login] cooldown_seconds must be a whole number >= 0, "
+                          f"got {cfg.login_cooldown!r}")
+    return ignore_users, cooldown
 
 
 def _well_formed(url):

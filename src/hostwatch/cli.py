@@ -278,18 +278,34 @@ def run_login(args, environ=None, detach=None, wait=None):
         # $HOSTWATCH_CONFIG is ignored; dry runs and --config still work.
         cfg = _load_config(args, "login", None if dry_run else config.DEFAULT_PATH)
         if cfg is not None:
-            if not dry_run:
-                # pam_systemd may register this session after our hook started;
-                # give logind a moment so the new session shows under Users.
-                wait(user, rhost if kind == "SSH" else None)
-            time_str = timefmt.format_time(moment, cfg.timezone)
+            try:
+                ignore_users, cooldown = config.login_settings(cfg)
+            except config.ConfigError as exc:
+                log.error(f"login: {exc}; ignoring [login] settings for this run")
+                ignore_users, cooldown = frozenset(), 0
+            skip = user.lower() in ignore_users
+            if skip:
+                log.info(f"login: user {user} is in [login] ignore_users, skipping")
+            # sshd opens a session for every connection, interactive or not, so
+            # scp/rsync/git-over-ssh/Ansible can each look like a login; collapse
+            # a burst for the same user and remote host into one notification.
+            elif (not dry_run and kind == "SSH"
+                    and state.login_recently_notified(f"{user}:{kind}:{rhost}", cooldown)):
+                skip = True
+                log.info(f"login: user {user} ({kind}) notified recently, skipping")
+            if not skip:
+                if not dry_run:
+                    # pam_systemd may register this session after our hook started;
+                    # give logind a moment so the new session shows under Users.
+                    wait(user, rhost if kind == "SSH" else None)
+                time_str = timefmt.format_time(moment, cfg.timezone)
 
-            def build():
-                machine, ips, users = _identity(cfg)
-                return messages.login_message(machine, user, kind, time_str, ips, users,
-                                              tty=tty, rhost=rhost)
+                def build():
+                    machine, ips, users = _identity(cfg)
+                    return messages.login_message(machine, user, kind, time_str, ips, users,
+                                                  tty=tty, rhost=rhost)
 
-            _deliver(args, cfg, build, slack.LOGIN_DELAYS, f"login ({user}, {kind})")
+                _deliver(args, cfg, build, slack.LOGIN_DELAYS, f"login ({user}, {kind})")
     except Exception as exc:  # never let a bug surface in the login path
         _log_unexpected("login", exc)
     if detached:

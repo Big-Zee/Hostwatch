@@ -12,7 +12,7 @@ There are four medium findings: one security exposure that depends on the host's
 
 Suggested fix order: #8 and #9, then #1, then #2.
 
-**Update:** #8, #9 and #1 are fixed (see "Fixed" notes under each). #2 is still open.
+**Update:** #8, #9, #1 and #2 are fixed (see "Fixed" notes under each).
 
 | # | Severity | Area | Finding |
 |---|---|---|---|
@@ -60,6 +60,14 @@ Suggested fix order: #8 and #9, then #1, then #2.
   - Announce SSH only when a terminal was allocated. Check on a VM what `PAM_TTY` holds for `ssh host true` and for an interactive `ssh host`.
   - Alternatively, add `[login] ignore_users` / `ignore_noninteractive` settings.
   - Add a simple rate limit, for example a timestamp file per user and remote host.
+- **Fixed:** `sshd` hardcodes `PAM_TTY` to the literal string `"ssh"` for every SSH PAM session,
+  interactive or not, so it cannot distinguish a real login from `scp`/`rsync`/Ansible — the
+  `PAM_TTY` check was dropped in favor of the two alternatives: a `[login] ignore_users` setting
+  (comma-separated PAM usernames never announced, e.g. service accounts) and a cooldown
+  (`[login] cooldown_seconds`, default 30s) that collapses repeated SSH notifications for the
+  same user and remote host into at most one per window, backed by a marker file per key in
+  `/var/lib/hostwatch/login-cooldown` (`config.login_settings`, `state.login_recently_notified`,
+  `cli.run_login`).
 
 ### 3. Low: a reboot from `rescue.target` is reported as an unclean shutdown
 

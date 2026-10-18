@@ -59,6 +59,25 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(config.ConfigError, setting):
                 config.heartbeat_settings(cfg)
 
+    def test_login_defaults(self):
+        cfg = config.load(self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n"))
+        self.assertEqual(config.login_settings(cfg), (frozenset(), 30))
+        example = config.load(REPO_EXAMPLE, require_webhook=False)
+        self.assertEqual(config.login_settings(example), (frozenset(), 30))
+
+    def test_login_values(self):
+        cfg = config.load(self.write(
+            f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\nignore_users = Backup, ansible,, \n"
+            "cooldown_seconds = 0\n"))
+        self.assertEqual(config.login_settings(cfg), (frozenset({"backup", "ansible"}), 0))
+
+    def test_invalid_login_settings(self):
+        for line in ("cooldown_seconds = -1", "cooldown_seconds = never", "cooldown_seconds = 7.5"):
+            path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[login]\n{line}\n")
+            cfg = config.load(path)  # loading still works: boot/heartbeat are unaffected
+            with self.assertRaisesRegex(config.ConfigError, "cooldown_seconds"):
+                config.login_settings(cfg)
+
     def test_example_leaves_machine_name_unset(self):
         self.assertEqual(config.load(REPO_EXAMPLE, require_webhook=False).machine_name, "")
 
@@ -193,6 +212,7 @@ class MissingSettingsTest(ConfigTest):
         self.assertEqual(config.missing_settings(path, REPO_EXAMPLE), [
             ("heartbeat", "enabled", "true"),
             ("heartbeat", "interval_minutes", "60"),
+            ("login", "cooldown_seconds", "30"),
         ])
 
     def test_complete_config_reports_nothing(self):
