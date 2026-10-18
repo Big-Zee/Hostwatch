@@ -12,6 +12,8 @@ There are four medium findings: one security exposure that depends on the host's
 
 Suggested fix order: #8 and #9, then #1, then #2.
 
+**Update:** #8 and #9 are fixed (see "Fixed" notes under each). #1 and #2 are still open.
+
 | # | Severity | Area | Finding |
 |---|---|---|---|
 | 1 | Medium (high where the condition holds) | Login / Security | Root login hook trusts the PAM environment |
@@ -106,6 +108,7 @@ Suggested fix order: #8 and #9, then #1, then #2.
 - **Fix:**
   - Make `run_heartbeat` skip when the timer became active less than about 60 s ago. Read `ActiveEnterTimestampMonotonic` of `hostwatch-heartbeat.timer` and compare it with `CLOCK_MONOTONIC`; a real first run is always at least 5 minutes after activation.
   - **Check on a VM:** with the interval at 60, run the service once, wait 6 minutes, set the interval to 5, run `install.sh --yes`, then watch `journalctl -u hostwatch-heartbeat`.
+- **Fixed:** `run_heartbeat` now skips when `netinfo.timer_recently_started("hostwatch-heartbeat.timer", 60)` is true, i.e. when `hostwatch-heartbeat.timer`'s current activation started under 60 s ago (read via `systemctl show -p ActiveEnterTimestampMonotonic`, compared against `time.monotonic()`). Since the shortest valid interval is 5 minutes, any run this soon after the timer (re)started is an artifact of the restart, not a genuine tick. Not checked on a VM yet.
 
 ### 9. Medium: `--reconfigure` can report "Webhook replaced" without changing anything (reproduced)
 
@@ -115,6 +118,7 @@ Suggested fix order: #8 and #9, then #1, then #2.
   - In all these cases the script makes a `.bak`, writes an unchanged file and prints "Webhook replaced".
   - An admin rotating a leaked webhook would believe the old one is gone. Once it is revoked in Slack, every notification fails with HTTP 404.
 - **Fix:** after `set_webhook`, compare the masked value from `hostwatch config-summary` with the expected last 4 characters. Alternatively, let a Python helper set the key with configparser-aware matching (input passed through the environment), and fail loudly when the key is missing.
+- **Fixed:** `install.sh` now has `verify_webhook`, called after every `set_webhook`. It re-reads the config through `hostwatch config-summary` and compares the masked webhook's last 4 characters against the new webhook's; on a mismatch it prints an error and `install.sh` exits 1 instead of reporting success.
 
 ### 10. Low: the hook-line check also matches a commented-out line
 

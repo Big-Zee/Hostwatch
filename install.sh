@@ -106,6 +106,25 @@ set_webhook() {
     commit_conf "$tmp"
 }
 
+# Confirm $CONF actually holds the webhook just written. set_webhook's awk only
+# rewrites a line matching `webhook_url *=` exactly; a file using
+# `webhook_url:`, a different letter case, or with no such line at all is
+# left unchanged, so the caller must not report success without this check.
+verify_webhook() {
+    local expected masked summary
+    expected="${1: -4}"
+    if ! summary="$("$BIN" config-summary --config "$CONF" --example "$SRC_DIR/config.example.ini")"; then
+        echo "install.sh: cannot re-read $CONF to confirm the webhook was changed" >&2
+        return 1
+    fi
+    masked="$(awk -F= '/^webhook=/ { print substr($0, 9) }' <<< "$summary")"
+    if [[ "$masked" != *"$expected" ]]; then
+        echo "install.sh: the webhook in $CONF was NOT changed (no 'webhook_url = ' line" \
+            "matched); edit $CONF by hand and set webhook_url under [slack]" >&2
+        return 1
+    fi
+}
+
 # Set [display] machine_name: replace the (possibly commented) machine_name
 # line in [display], or add one to that section, or add the section.
 set_machine_name() {
@@ -221,6 +240,7 @@ if [[ -e "$CONF" ]]; then
         # Never change the config without a copy of the previous one.
         install -m 600 -o root -g root "$CONF" "$CONF.bak"
         set_webhook "$webhook"
+        verify_webhook "$webhook" || exit 1
         echo "Webhook replaced in $CONF (previous file saved as $CONF.bak)"
     fi
     unset webhook
@@ -235,6 +255,7 @@ else
     fi
     if [[ -n "$webhook" ]] && check_webhook "$webhook" "keeping the placeholder"; then
         set_webhook "$webhook"
+        verify_webhook "$webhook" || exit 1
         echo "Webhook saved to $CONF"
     fi
     unset webhook

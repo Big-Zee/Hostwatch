@@ -125,5 +125,32 @@ class ShutdownDetectionTest(unittest.TestCase):
         self.assertFalse(netinfo.system_stopping(run=failing))
 
 
+class TimerRecentlyStartedTest(unittest.TestCase):
+    def test_true_just_after_activation(self):
+        with mock.patch.object(netinfo.time, "monotonic", return_value=100.0):
+            run = systemctl_out("90000000\n")  # 10 s of monotonic time ago
+            self.assertTrue(netinfo.timer_recently_started("hostwatch-heartbeat.timer", 60,
+                                                             run=run))
+        self.assertEqual(run.call_args.args[0],
+                          ["systemctl", "show", "hostwatch-heartbeat.timer",
+                           "-p", "ActiveEnterTimestampMonotonic", "--value"])
+
+    def test_false_once_past_the_threshold(self):
+        with mock.patch.object(netinfo.time, "monotonic", return_value=200.0):
+            run = systemctl_out("90000000\n")  # 110 s of monotonic time ago
+            self.assertFalse(netinfo.timer_recently_started("hostwatch-heartbeat.timer", 60,
+                                                              run=run))
+
+    def test_never_active_does_not_skip(self):
+        self.assertFalse(netinfo.timer_recently_started("x.timer", 60, run=systemctl_out("0\n")))
+
+    def test_unreadable_output_does_not_skip(self):
+        self.assertFalse(netinfo.timer_recently_started("x.timer", 60, run=systemctl_out("n/a\n")))
+
+    def test_systemctl_unavailable_does_not_skip(self):
+        failing = mock.Mock(side_effect=FileNotFoundError("systemctl"))
+        self.assertFalse(netinfo.timer_recently_started("x.timer", 60, run=failing))
+
+
 if __name__ == "__main__":
     unittest.main()

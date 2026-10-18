@@ -594,6 +594,23 @@ class HeartbeatCommandTest(unittest.TestCase):
         post.assert_not_called()
         self.assertIn("interval_minutes", error.call_args.args[0])
 
+    @mock.patch.object(cli.log, "info")
+    def test_skips_right_after_timer_restart(self, info, *_):
+        with mock.patch.object(cli.netinfo, "timer_recently_started", return_value=True), \
+                mock.patch.object(cli.slack, "post") as post:
+            self.assertEqual(cli.main(["heartbeat", "--config", self.config()]), 0)
+        post.assert_not_called()
+        info.assert_called_with("heartbeat: timer just (re)started, skipping this run")
+
+    def test_dry_run_ignores_timer_restart_guard(self, *_):
+        with mock.patch.object(cli.netinfo, "timer_recently_started", return_value=True) as guard, \
+                mock.patch.object(cli.netinfo, "local_addresses", return_value=[]), \
+                mock.patch.object(cli.slack, "post") as post:
+            code, _out = run(["heartbeat", "--dry-run", "--config", EXAMPLE])
+        self.assertEqual(code, 0)
+        guard.assert_not_called()
+        post.assert_not_called()  # dry runs never post regardless
+
     def test_failed_delivery_exits_zero(self, *_):
         with mock.patch.object(cli.netinfo, "local_addresses", return_value=[]), \
                 mock.patch.object(cli.slack, "post", return_value=False):

@@ -9,6 +9,14 @@ from . import config, log, messages, netinfo, processes, sessions, slack, state,
 
 LOGIN_DEADLINE = 60  # seconds the detached login sender may live
 
+HEARTBEAT_TIMER_UNIT = "hostwatch-heartbeat.timer"
+# OnUnitActiveSec/OnActiveSec count from when the timer last (re)started, so a
+# restart that shortens the interval (install.sh --reconfigure, or an admin
+# running it by hand) can make systemd fire immediately. The shortest valid
+# interval is 5 minutes, so a run this soon after the timer started is never
+# a genuine tick.
+HEARTBEAT_START_GRACE = 60
+
 # PAM service -> login type. Anything not listed (su, sudo, cron, systemd-user,
 # gdm-launch-environment, ...) is ignored.
 LOGIN_SERVICES = {
@@ -127,6 +135,10 @@ def run_heartbeat(args):
             return 0
         if not enabled:
             log.info("heartbeat: disabled in config, skipping")
+            return 0
+        if not getattr(args, "dry_run", False) and netinfo.timer_recently_started(
+                HEARTBEAT_TIMER_UNIT, HEARTBEAT_START_GRACE):
+            log.info("heartbeat: timer just (re)started, skipping this run")
             return 0
         uptime = timefmt.uptime_seconds()
         boot_time = timefmt.kernel_boot_time()

@@ -3,6 +3,7 @@ import ipaddress
 import json
 import socket
 import subprocess
+import time
 
 from . import log
 
@@ -73,6 +74,29 @@ def shutdown_kind(run=subprocess.run):
     out = _systemctl(["list-jobs", "--no-legend", "--plain"], run) or ""
     units = {fields[1] for fields in (line.split() for line in out.splitlines()) if len(fields) > 1}
     return "Rebooting" if units.intersection(REBOOT_TARGETS) else "Shutting down"
+
+
+def timer_recently_started(unit, threshold_seconds, run=subprocess.run):
+    """True if ``unit`` (a .timer) entered its current active state under
+    ``threshold_seconds`` ago.
+
+    OnActiveSec/OnUnitActiveSec count from this moment, not from the wall
+    clock, so a timer that was just (re)started cannot yet have a real,
+    scheduled trigger: anything that fires this soon is an artifact of the
+    restart (for example install.sh applying a shorter interval), not a
+    genuine tick. False (never skip) when systemctl cannot be asked.
+    """
+    out = _systemctl(["show", unit, "-p", "ActiveEnterTimestampMonotonic", "--value"], run)
+    if out is None:
+        return False
+    try:
+        started_usec = int(out.strip())
+    except ValueError:
+        return False
+    if started_usec <= 0:
+        return False
+    now_usec = time.monotonic() * 1_000_000
+    return (now_usec - started_usec) < threshold_seconds * 1_000_000
 
 
 def local_addresses(skip_prefixes, include_ipv6=False, run=subprocess.run):
