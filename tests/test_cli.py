@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from hostwatch import cli, state
+from hostwatch import cli, state, uptime
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXAMPLE = os.path.join(REPO, "config.example.ini")
@@ -45,6 +45,13 @@ def set_marker(present):
         open(marker_path(), "w").close()
     elif os.path.exists(marker_path()):
         os.remove(marker_path())
+
+
+def clear_uptime_state():
+    for path in (os.path.join(os.environ[state.STATE_DIR_ENV], uptime.LEDGER_NAME),
+                os.path.join(os.environ[state.STATE_DIR_ENV], uptime.LAST_ALIVE_NAME)):
+        if os.path.exists(path):
+            os.remove(path)
 
 
 def run(argv, **kw):
@@ -427,6 +434,127 @@ class BootMarkerTest(unittest.TestCase):
 
 
 @mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
+@mock.patch.object(cli.netinfo, "local_addresses", return_value=[])
+@mock.patch.object(cli.log, "warning")
+class BootUptimeTest(unittest.TestCase):
+    def setUp(self):
+        self.config = write_config()
+        self.addCleanup(os.remove, self.config)
+        clear_uptime_state()
+
+    def boot(self, now, boot_time, *extra):
+        with mock.patch.object(cli.timefmt, "now", return_value=now), \
+                mock.patch.object(cli.timefmt, "kernel_boot_time", return_value=boot_time), \
+                mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.main(["boot", "--config", self.config, *extra]), 0)
+        return post
+
+    def test_crash_then_boot_closes_ledger_with_estimate(self, _warning, _ips, _host):
+        set_marker(False)  # unclean: the previous run never closed its entry
+        crash_boot = datetime(2026, 10, 11, 8, 0, tzinfo=timezone.utc)
+        last_alive = datetime(2026, 10, 11, 9, 55, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)
+        uptime.record_boot(crash_boot, 90)
+        uptime.touch_last_alive(last_alive)
+
+        post = self.boot(now, now)
+
+        entries, status = uptime.load_ledger()
+        self.assertEqual(status, "ok")
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["end"], last_alive)
+        self.assertEqual(entries[0]["reason"], "unclean")
+        self.assertTrue(entries[0]["estimated"])
+        self.assertIsNone(entries[1]["end"])  # this boot's own open entry
+        payload = post.call_args.args[1]()
+        self.assertIn("Uptime today before this boot", str(payload))
+
+    def test_crash_with_no_last_alive_closes_at_own_start(self, _warning, _ips, _host):
+        set_marker(False)
+        crash_boot = datetime(2026, 10, 11, 8, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 11, 8, 1, tzinfo=timezone.utc)
+        uptime.record_boot(crash_boot, 90)
+
+        self.boot(now, now)
+
+        entries, _status = uptime.load_ledger()
+        self.assertEqual(entries[0]["end"], crash_boot)
+        self.assertTrue(entries[0]["estimated"])
+
+    def test_clean_boot_records_new_open_entry(self, _warning, _ips, _host):
+        set_marker(True)
+        now = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
+
+        self.boot(now, now)
+
+        entries, status = uptime.load_ledger()
+        self.assertEqual(status, "ok")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["start"], now)
+        self.assertIsNone(entries[0]["end"])
+
+    def test_no_prior_session_omits_field(self, _warning, _ips, _host):
+        set_marker(True)
+        now = datetime(2026, 10, 11, 7, 0, tzinfo=timezone.utc)
+
+        post = self.boot(now, now)
+
+        payload = post.call_args.args[1]()
+        self.assertNotIn("Uptime today before this boot", str(payload))
+
+    def test_dry_run_does_not_mutate_ledger(self, _warning, _ips, _host):
+        set_marker(False)
+        now = datetime(2026, 10, 11, 9, 0, tzinfo=timezone.utc)
+        self.boot(now, now, "--dry-run")
+        entries, status = uptime.load_ledger()
+        self.assertEqual((entries, status), ([], "absent"))
+
+    def test_boot_prunes_using_real_now_not_stale_last_alive(self, _warning, _ips, _host):
+        set_marker(False)
+        path = write_config()
+        self.addCleanup(os.remove, path)
+        with open(path, "a") as fh:
+            fh.write("[uptime]\nretention_days = 10\n")
+        crash_boot = datetime(2026, 10, 1, 8, 0, tzinfo=timezone.utc)
+        stale_last_alive = datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 22, 0, 0, tzinfo=timezone.utc)  # 21 days after the old entry
+        uptime._atomic_write(uptime._ledger_path(), json.dumps([
+            {"start": "2026-09-01T00:00:00+00:00", "end": "2026-09-01T01:00:00+00:00",
+             "reason": "clean", "estimated": False},
+        ]))
+        uptime.record_boot(crash_boot, 10)
+        uptime.touch_last_alive(stale_last_alive)
+
+        with mock.patch.object(cli.timefmt, "now", return_value=now), \
+                mock.patch.object(cli.timefmt, "kernel_boot_time", return_value=now), \
+                mock.patch.object(cli.slack, "post", return_value=True):
+            self.assertEqual(cli.main(["boot", "--config", path]), 0)
+
+        entries, _status = uptime.load_ledger()
+        # Pruned using the real boot time, not the stale last-alive reading
+        # (2026-10-01), which would compute a cutoff too early to drop it.
+        self.assertFalse(any(e["start"] < datetime(2026, 9, 2, tzinfo=timezone.utc)
+                             for e in entries))
+
+    def test_invalid_uptime_config_still_sends_boot_message(self, _warning, _ips, _host):
+        set_marker(True)
+        path = write_config()
+        self.addCleanup(os.remove, path)
+        with open(path, "a") as fh:
+            fh.write("[uptime]\nretention_days = never\n")
+        now = datetime(2026, 10, 11, 9, 0, tzinfo=timezone.utc)
+        with mock.patch.object(cli.timefmt, "now", return_value=now), \
+                mock.patch.object(cli.timefmt, "kernel_boot_time", return_value=now), \
+                mock.patch.object(cli.log, "error") as error, \
+                mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.main(["boot", "--config", path]), 0)
+        post.assert_called_once()
+        error.assert_called()
+        payload = post.call_args.args[1]()
+        self.assertNotIn("Uptime today before this boot", str(payload))
+
+
+@mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
 @mock.patch.object(cli.netinfo, "local_addresses", return_value=[("enp3s0", "192.168.1.20")])
 @mock.patch.object(cli.netinfo, "shutdown_kind", return_value="Rebooting")
 @mock.patch.object(cli.timefmt, "uptime_seconds", return_value=5 * 3600 + 12 * 60)
@@ -435,6 +563,7 @@ class ShutdownCommandTest(unittest.TestCase):
         self.config = write_config()
         self.addCleanup(os.remove, self.config)
         set_marker(False)
+        clear_uptime_state()
 
     @mock.patch.object(cli.log, "info")
     def test_not_a_system_shutdown(self, info, *_):
@@ -490,6 +619,52 @@ class ShutdownCommandTest(unittest.TestCase):
         post.assert_not_called()
         self.assertFalse(os.path.exists(marker_path()))
         self.assertTrue(json.loads(out)["text"].startswith("my-pc · Rebooting at "))
+
+    def test_dry_run_previews_uptime_today_without_closing(self, *_):
+        boot_time = datetime(2026, 10, 11, 8, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)
+        uptime.record_boot(boot_time, 90)
+        with mock.patch.object(cli.timefmt, "now", return_value=now), \
+                mock.patch.object(cli.timefmt, "kernel_boot_time", return_value=boot_time), \
+                mock.patch.object(cli.slack, "post") as post:
+            code, out = run(["shutdown", "--dry-run", "--config", self.config])
+        self.assertEqual(code, 0)
+        post.assert_not_called()
+        self.assertIn("Uptime today", out)
+        entries, _status = uptime.load_ledger()
+        self.assertIsNone(entries[0]["end"])  # dry run must not close the ledger
+
+    def test_closes_ledger_and_shows_uptime_today(self, *_):
+        boot_time = datetime(2026, 10, 11, 8, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)
+        uptime.record_boot(boot_time, 90)
+        with mock.patch.object(cli.netinfo, "system_stopping", return_value=True), \
+                mock.patch.object(cli.timefmt, "now", return_value=now), \
+                mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.main(["shutdown", "--config", self.config]), 0)
+        entries, _status = uptime.load_ledger()
+        self.assertEqual(entries[-1]["end"], now)
+        self.assertEqual(entries[-1]["reason"], "reboot")
+        self.assertIn("Uptime today", str(post.call_args.args[1]))
+
+    def test_ledger_failure_still_sends_message_without_field(self, *_):
+        with mock.patch.object(cli.netinfo, "system_stopping", return_value=True), \
+                mock.patch.object(cli.uptime, "close_open_entry", return_value=False), \
+                mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.main(["shutdown", "--config", self.config]), 0)
+        post.assert_called_once()
+        self.assertNotIn("Uptime today", str(post.call_args.args[1]))
+
+    @mock.patch.object(cli.log, "error")
+    def test_unexpected_ledger_bug_still_sends_message_without_field(self, error, *_):
+        with mock.patch.object(cli.netinfo, "system_stopping", return_value=True), \
+                mock.patch.object(cli.uptime, "close_open_entry",
+                                  side_effect=RuntimeError("bug")), \
+                mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.main(["shutdown", "--config", self.config]), 0)
+        post.assert_called_once()
+        self.assertNotIn("Uptime today", str(post.call_args.args[1]))
+        error.assert_called()
 
 
 @mock.patch.object(cli.netinfo, "hostname", return_value="my-pc")
@@ -610,6 +785,9 @@ TOP = [cli.processes.Row(2412, "alice", 98.0, 3.1, "yes")]
 @mock.patch.object(cli.timefmt, "kernel_boot_time",
                    return_value=datetime(2026, 10, 11, 7, 14, 30, tzinfo=timezone.utc))
 class HeartbeatCommandTest(unittest.TestCase):
+    def setUp(self):
+        clear_uptime_state()
+
     def config(self, extra=""):
         fd, path = tempfile.mkstemp(suffix=".ini")
         with os.fdopen(fd, "w") as fh:
@@ -687,6 +865,28 @@ class HeartbeatCommandTest(unittest.TestCase):
         post.assert_not_called()
         self.assertIn("Top processes", out)
 
+    def test_uptime_today_field_and_last_alive_touch(self, *_):
+        path = self.config()
+        now = datetime(2026, 10, 11, 10, 14, 30, tzinfo=timezone.utc)
+        with mock.patch.object(cli.netinfo, "local_addresses", return_value=[]), \
+                mock.patch.object(cli.timefmt, "now", return_value=now), \
+                mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.main(["heartbeat", "--config", path]), 0)
+        payload = post.call_args.args[1]
+        self.assertIn("Uptime today", str(payload))
+        last_alive = uptime.read_last_alive()
+        self.assertAlmostEqual(last_alive.timestamp(), now.timestamp(), delta=1)
+
+    def test_daily_summary_disabled_omits_field_but_still_touches_last_alive(self, *_):
+        path = self.config("[uptime]\ndaily_summary_enabled = false\n")
+        now = datetime(2026, 10, 11, 10, 14, 30, tzinfo=timezone.utc)
+        with mock.patch.object(cli.netinfo, "local_addresses", return_value=[]), \
+                mock.patch.object(cli.timefmt, "now", return_value=now), \
+                mock.patch.object(cli.slack, "post", return_value=True) as post:
+            self.assertEqual(cli.main(["heartbeat", "--config", path]), 0)
+        self.assertNotIn("Uptime today", str(post.call_args.args[1]))
+        self.assertIsNotNone(uptime.read_last_alive())
+
     def test_heartbeat_interval_helper(self, *_):
         code, out = run(["heartbeat-interval", "--config", self.config()])
         self.assertEqual((code, out.strip()), (0, "60"))
@@ -708,6 +908,46 @@ class HeartbeatCommandTest(unittest.TestCase):
         helptext = cli.build_parser().format_help()
         self.assertIn("heartbeat", helptext)
         self.assertNotIn("heartbeat-interval", helptext)
+
+    def test_uptime_interval_helper(self, *_):
+        code, out = run(["uptime-interval", "--config", self.config()])
+        self.assertEqual((code, out.strip()), (0, "5"))
+        code, out = run(["uptime-interval", "--config",
+                         self.config("[uptime]\nlast_alive_interval_minutes = 10\n")])
+        self.assertEqual((code, out.strip()), (0, "10"))
+        with mock.patch.object(cli.log, "error") as error:
+            code, out = run(["uptime-interval", "--config",
+                             self.config("[uptime]\nretention_days = 0\n")])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("retention_days", error.call_args.args[0])
+
+    def test_uptime_interval_works_with_placeholder_webhook(self, *_):
+        code, out = run(["uptime-interval", "--config", EXAMPLE])
+        self.assertEqual((code, out.strip()), (0, "5"))
+
+    def test_uptime_interval_hidden_from_help(self, *_):
+        self.assertNotIn("uptime-interval", cli.build_parser().format_help())
+
+
+class LastAliveCommandTest(unittest.TestCase):
+    def setUp(self):
+        clear_uptime_state()
+
+    def test_updates_timestamp(self):
+        path = write_config()
+        self.addCleanup(os.remove, path)
+        code, _out = run(["last-alive", "--config", path])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(uptime.read_last_alive())
+
+    def test_works_with_placeholder_webhook(self):
+        # install.sh and the timer may run before a webhook is configured.
+        code, _out = run(["last-alive", "--config", EXAMPLE])
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(uptime.read_last_alive())
+
+    def test_hidden_from_help(self):
+        self.assertNotIn("last-alive", cli.build_parser().format_help())
 
 
 class ConfigSummaryTest(unittest.TestCase):

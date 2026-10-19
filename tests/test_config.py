@@ -59,6 +59,35 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaisesRegex(config.ConfigError, setting):
                 config.heartbeat_settings(cfg)
 
+    def test_uptime_defaults(self):
+        cfg = config.load(self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n"))
+        self.assertEqual(config.uptime_settings(cfg), (True, 5, 90))
+        example = config.load(REPO_EXAMPLE, require_webhook=False)
+        self.assertEqual(config.uptime_settings(example), (True, 5, 90))
+
+    def test_uptime_values(self):
+        cfg = config.load(self.write(
+            f"[slack]\nwebhook_url = {WEBHOOK}\n[uptime]\ndaily_summary_enabled = no\n"
+            "last_alive_interval_minutes = 10\nretention_days = 30\n"))
+        self.assertEqual(config.uptime_settings(cfg), (False, 10, 30))
+        for edge in ("1", "60"):
+            cfg = config.load(self.write(
+                f"[slack]\nwebhook_url = {WEBHOOK}\n[uptime]\n"
+                f"last_alive_interval_minutes = {edge}\n"))
+            self.assertEqual(config.uptime_settings(cfg)[1], int(edge))
+
+    def test_invalid_uptime_settings(self):
+        for line, setting in (("last_alive_interval_minutes = 0", "last_alive_interval_minutes"),
+                              ("last_alive_interval_minutes = 61", "last_alive_interval_minutes"),
+                              ("last_alive_interval_minutes = often", "last_alive_interval_minutes"),
+                              ("retention_days = 0", "retention_days"),
+                              ("retention_days = never", "retention_days"),
+                              ("daily_summary_enabled = sometimes", "daily_summary_enabled")):
+            path = self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n[uptime]\n{line}\n")
+            cfg = config.load(path)  # loading still works: boot/login are unaffected
+            with self.assertRaisesRegex(config.ConfigError, setting):
+                config.uptime_settings(cfg)
+
     def test_login_defaults(self):
         cfg = config.load(self.write(f"[slack]\nwebhook_url = {WEBHOOK}\n"))
         self.assertEqual(config.login_settings(cfg), (frozenset(), 30))
@@ -212,6 +241,9 @@ class MissingSettingsTest(ConfigTest):
         self.assertEqual(config.missing_settings(path, REPO_EXAMPLE), [
             ("heartbeat", "enabled", "true"),
             ("heartbeat", "interval_minutes", "60"),
+            ("uptime", "daily_summary_enabled", "true"),
+            ("uptime", "last_alive_interval_minutes", "5"),
+            ("uptime", "retention_days", "90"),
             ("login", "cooldown_seconds", "30"),
         ])
 

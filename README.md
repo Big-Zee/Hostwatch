@@ -11,10 +11,10 @@ Every message has the same shape:
   - **Users**: who is logged in right now (see [Using HostWatch on several machines](#using-hostwatch-on-several-machines)).
 
 Event-specific fields:
-- **Boot** (`· Boot`): time and kernel boot time. If the previous shutdown was not clean, the message starts with *Previous shutdown was not clean (power loss or crash?)*.
-- **Shutdown** (`· Shutting down` / `· Rebooting`): time and uptime, for example `up 5 h 12 min`.
+- **Boot** (`· Boot`): time and kernel boot time. If the previous shutdown was not clean, the message starts with *Previous shutdown was not clean (power loss or crash?)*. May also show **Uptime today before this boot**. See [Uptime today](#uptime-today).
+- **Shutdown** (`· Shutting down` / `· Rebooting`): time, uptime (for example `up 5 h 12 min`), and **Uptime today** (including the session that is ending). See [Uptime today](#uptime-today).
 - **Login** (`· Login: alice`): username, login type (Graphical, TTY or SSH), time, plus the remote IP for SSH or the terminal for TTY.
-- **Heartbeat** (`· Heartbeat`, every 60 minutes by default): uptime (`up 3 h 0 min`), boot time (`since 2026-10-11 09:14 CEST`), and a table of the top 5 processes by current CPU use. Local IP shows IPv4 only. See [Heartbeat](#heartbeat).
+- **Heartbeat** (`· Heartbeat`, every 60 minutes by default): uptime (`up 3 h 0 min`), boot time (`since 2026-10-11 09:14 CEST`), **Uptime today**, and a table of the top 5 processes by current CPU use. Local IP shows IPv4 only. See [Heartbeat](#heartbeat) and [Uptime today](#uptime-today).
 - **Test** (`· Test`, from `hostwatch test`): time. It shows exactly how this machine appears in the channel.
 
 The only network request HostWatch makes is the message to Slack. It is plain Python 3 with only the standard library, and is tested on Ubuntu 24.04. Boot, shutdown and login never wait noticeably for Slack. Boot and login failures are retried, then logged to the systemd journal.
@@ -51,10 +51,11 @@ The only network request HostWatch makes is the message to Slack. It is plain Py
 - installs `hostwatch-boot.service` and enables it
 - installs `hostwatch-shutdown.service`, enables it and starts it, so the very next shutdown is announced
 - installs `hostwatch-heartbeat.timer` / `.service`, applies `[heartbeat] interval_minutes` to the timer, and starts it
+- installs `hostwatch-last-alive.timer` / `.service`, applies `[uptime] last_alive_interval_minutes` to the timer, and starts it (see [Uptime today](#uptime-today))
 - on first install, creates `/var/lib/hostwatch/` and records a clean state, so the first boot shows no unclean-shutdown warning
 - adds the login hook with `pam-auth-update` and checks that it is in `/etc/pam.d/common-session`
 - creates `/etc/hostwatch/config.ini` (root, mode `600`) from `config.example.ini`, or shows the existing one and asks whether to keep it (see below)
-- checks that the heartbeat timer has a next run, and warns if not
+- checks that the heartbeat timer and the last-alive timer each have a next run, and warns if not
 
 ### Running it again (upgrades)
 
@@ -115,6 +116,9 @@ The config file is `/etc/hostwatch/config.ini`. It holds the webhook secret, so 
 | `[heartbeat]` | `interval_minutes` | `60` | Minutes between heartbeats (5–1440), the first one interval after boot; run `install.sh` again after changing it |
 | `[login]` | `ignore_users` | *(unset)* | Comma-separated PAM usernames never announced as a login, e.g. automation or service accounts |
 | `[login]` | `cooldown_seconds` | `30` | Collapses repeated SSH login notifications for the same user and remote host into at most one per this many seconds (`0` disables it); `sshd` opens a PAM session for every connection, not only interactive ones, so `scp`/`rsync`/`git`-over-SSH/Ansible can each otherwise post one |
+| `[uptime]` | `daily_summary_enabled` | `true` | `false` turns off the "Uptime today" field on boot, shutdown and heartbeat messages (the ledger and last-alive timer keep running either way) |
+| `[uptime]` | `last_alive_interval_minutes` | `5` | Minutes between last-alive timestamp updates (1–60); run `install.sh` again after changing it |
+| `[uptime]` | `retention_days` | `90` | How many days of boot-session history to keep in the uptime ledger |
 
 Changes take effect at the next boot, shutdown or login. There is no daemon to restart.
 
@@ -173,6 +177,17 @@ Top processes (CPU over 1 s, % of one core)
 - **Delivery.** One attempt with a 5 s timeout. If Slack is unreachable, the failure is logged (`journalctl -t hostwatch`) and that heartbeat is dropped. Missed heartbeats are never queued or resent.
 - **System-wide.** It is a root-owned system timer: it works whoever is logged in, and only administrators can stop or change it. A run takes a few seconds at low CPU and I/O priority.
 
+## Uptime today
+
+Boot, shutdown and heartbeat messages can show **Uptime today**: the total time the machine has been powered on during the local calendar day, summed across every boot session that overlaps today (a session that started before midnight only counts from 00:00), for example `5 h 42 min (2 sessions)`. The heartbeat and shutdown/reboot message include the session currently running (or ending); the boot message can optionally show the total from *before* this boot.
+
+- **Where it comes from.** HostWatch keeps a small ledger of boot sessions at `/var/lib/hostwatch/uptime.json` (owner root, mode `600`): boot time, end time and end reason (clean shutdown, reboot, or unclean). A boot opens an entry; a clean shutdown or reboot closes it.
+- **After a crash.** A lightweight root timer, `hostwatch-last-alive.timer` (every `[uptime] last_alive_interval_minutes`, default 5 minutes), and every heartbeat, record a "last alive" timestamp. If a boot finds the previous entry still open (power loss, crash, hard reset), it closes it using that timestamp and marks it an estimate: the figure is then prefixed with `~`, for example `~5 h 40 min (2 sessions)`.
+- **Turning it off.** Set `[uptime] daily_summary_enabled = false`. The ledger and the last-alive timer keep running either way, so the figure is still accurate if you turn it back on later.
+- **Never holds up a notification.** If the ledger can't be read or updated, the boot, shutdown or heartbeat message is still sent without the "Uptime today" field, and the reason is logged (`journalctl -t hostwatch`).
+- **History kept.** Ledger entries older than `[uptime] retention_days` (default 90) are pruned automatically.
+- **Suspend/hibernate.** Not accounted for: time is counted by wall clock from boot to shutdown, so a suspended machine's "off" time is still counted as uptime. This only matters on laptops and other machines that suspend; servers that run until shutdown are unaffected.
+
 ## Shutdown and unclean-shutdown detection
 
 `hostwatch-boot.service` starts once the network is online, but nothing in the boot waits for it. It is declared without systemd's default dependencies, so `multi-user.target` is reached on time even when the network never comes online (an offline boot is not slowed down by HostWatch). After sending, the unit stays active and is ignored by `systemctl isolate`, so switching targets (for example to `rescue.target` and back) sends no second boot message.
@@ -220,6 +235,7 @@ hostwatch test                 # send a test message; exit status 1 if it fails
 hostwatch boot                 # what the boot unit runs
 hostwatch shutdown             # what the shutdown unit runs at poweroff/reboot (does nothing otherwise)
 hostwatch heartbeat            # what the heartbeat timer runs (sends one heartbeat now)
+hostwatch last-alive           # what the last-alive timer runs (updates the uptime ledger's timestamp)
 hostwatch login                # what the PAM hook runs (reads PAM_* variables)
 
 # Preview a payload without sending it (works with the example config):
@@ -239,7 +255,8 @@ journalctl -u hostwatch-boot              # the boot unit
 journalctl -b -1 -u hostwatch-shutdown    # the shutdown unit, previous boot
 journalctl -t hostwatch                   # all HostWatch log entries
 journalctl -u hostwatch-heartbeat         # heartbeat runs
-systemctl list-timers hostwatch-heartbeat.timer   # when the next heartbeat is due
+journalctl -u hostwatch-last-alive        # last-alive timer runs
+systemctl list-timers hostwatch-heartbeat.timer hostwatch-last-alive.timer   # when each is next due
 systemctl status hostwatch-boot hostwatch-shutdown   # the shutdown unit should be "active (exited)"
 grep hostwatch /etc/pam.d/common-session
 ```
@@ -268,6 +285,8 @@ At boot, the service retries for up to about 2.5 minutes in the background. At s
 sudo ./uninstall.sh            # keeps /etc/hostwatch; removes /var/lib/hostwatch
 sudo ./uninstall.sh --purge    # also removes the config and config.ini.bak
 ```
+
+If the boot-session uptime ledger (`/var/lib/hostwatch/uptime.json`) exists, `uninstall.sh` asks whether to delete it along with the rest of `/var/lib/hostwatch`; answering anything but yes, or running it non-interactively, keeps the ledger on disk.
 
 ## Development
 

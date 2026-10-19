@@ -16,6 +16,9 @@ DEFAULT_SKIP_INTERFACES = (
 DEFAULT_HEARTBEAT_INTERVAL = 60
 HEARTBEAT_INTERVAL_RANGE = (5, 1440)
 DEFAULT_LOGIN_COOLDOWN = 30
+DEFAULT_LAST_ALIVE_INTERVAL = 5
+LAST_ALIVE_INTERVAL_RANGE = (1, 60)
+DEFAULT_RETENTION_DAYS = 90
 
 
 class ConfigError(Exception):
@@ -37,6 +40,11 @@ class Config:
     # cannot silence login notifications outright.
     login_ignore_users: str = ""
     login_cooldown: str = str(DEFAULT_LOGIN_COOLDOWN)
+    # Raw [uptime] values; validated only by uptime_settings(), so a typo
+    # there cannot silence boot, login, shutdown or heartbeat notifications.
+    uptime_daily_summary: str = "true"
+    uptime_last_alive_interval: str = str(DEFAULT_LAST_ALIVE_INTERVAL)
+    uptime_retention_days: str = str(DEFAULT_RETENTION_DAYS)
 
 
 def resolve_path(explicit=None):
@@ -75,6 +83,13 @@ def load(path=None, require_webhook=True):
         login_ignore_users=parser.get("login", "ignore_users", fallback="").strip(),
         login_cooldown=parser.get("login", "cooldown_seconds",
                                   fallback=str(DEFAULT_LOGIN_COOLDOWN)).strip(),
+        uptime_daily_summary=parser.get("uptime", "daily_summary_enabled",
+                                        fallback="true").strip(),
+        uptime_last_alive_interval=parser.get(
+            "uptime", "last_alive_interval_minutes",
+            fallback=str(DEFAULT_LAST_ALIVE_INTERVAL)).strip(),
+        uptime_retention_days=parser.get("uptime", "retention_days",
+                                         fallback=str(DEFAULT_RETENTION_DAYS)).strip(),
     )
     validate(cfg, require_webhook)
     return cfg
@@ -123,6 +138,9 @@ _DEFAULTS = {
     ("heartbeat", "enabled"): "true",
     ("heartbeat", "interval_minutes"): str(DEFAULT_HEARTBEAT_INTERVAL),
     ("login", "cooldown_seconds"): str(DEFAULT_LOGIN_COOLDOWN),
+    ("uptime", "daily_summary_enabled"): "true",
+    ("uptime", "last_alive_interval_minutes"): str(DEFAULT_LAST_ALIVE_INTERVAL),
+    ("uptime", "retention_days"): str(DEFAULT_RETENTION_DAYS),
 }
 
 
@@ -173,6 +191,31 @@ def login_settings(cfg):
         raise ConfigError(f"[login] cooldown_seconds must be a whole number >= 0, "
                           f"got {cfg.login_cooldown!r}")
     return ignore_users, cooldown
+
+
+def uptime_settings(cfg):
+    """Return (daily_summary_enabled, last_alive_interval_minutes, retention_days),
+    or raise ConfigError naming the bad setting."""
+    enabled = configparser.ConfigParser.BOOLEAN_STATES.get(cfg.uptime_daily_summary.lower())
+    if enabled is None:
+        raise ConfigError(f"[uptime] daily_summary_enabled must be true or false, got "
+                          f"{cfg.uptime_daily_summary!r}")
+    low, high = LAST_ALIVE_INTERVAL_RANGE
+    try:
+        interval = int(cfg.uptime_last_alive_interval)
+    except ValueError:
+        interval = None
+    if interval is None or not low <= interval <= high:
+        raise ConfigError(f"[uptime] last_alive_interval_minutes must be a whole number from "
+                          f"{low} to {high}, got {cfg.uptime_last_alive_interval!r}")
+    try:
+        retention_days = int(cfg.uptime_retention_days)
+    except ValueError:
+        retention_days = None
+    if retention_days is None or retention_days < 1:
+        raise ConfigError(f"[uptime] retention_days must be a whole number >= 1, "
+                          f"got {cfg.uptime_retention_days!r}")
+    return enabled, interval, retention_days
 
 
 def _well_formed(url):

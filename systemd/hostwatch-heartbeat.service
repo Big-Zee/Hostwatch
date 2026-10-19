@@ -16,3 +16,6 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+# Writable /var/lib/hostwatch: the heartbeat also updates the last-alive
+# timestamp and reads the uptime-today ledger.
+StateDirectory=hostwatch

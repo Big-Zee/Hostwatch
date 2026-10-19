@@ -1,0 +1,18 @@
+[Unit]
+Description=Record that HostWatch's host is still alive (uptime-today ledger)
+Documentation=https://github.com/Big-Zee/Hostwatch
+
+# Started by hostwatch-last-alive.timer; no [Install] section.
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hostwatch last-alive
+TimeoutStartSec=30
+Nice=10
+IOSchedulingClass=idle
+SyslogIdentifier=hostwatch
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Writable /var/lib/hostwatch for the last-alive timestamp file.
+StateDirectory=hostwatch
