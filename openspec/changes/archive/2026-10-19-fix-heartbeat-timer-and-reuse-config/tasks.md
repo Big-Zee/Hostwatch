@@ -62,18 +62,18 @@ Run the unit tests with `python3 -m unittest discover -s tests -t .`. Installer 
 
 ## 5. Checks on an Ubuntu 24.04 host
 
-- [ ] 5.1 Run `shellcheck install.sh` and verify that it prints no warnings. Fix any it reports.
-- [ ] 5.2 Set `interval_minutes = 5`, run `sudo ./install.sh --yes`, and verify all of the following:
+- [x] 5.1 Run `shellcheck install.sh` and verify that it prints no warnings. Fix any it reports.
+- [x] 5.2 Set `interval_minutes = 5`, run `sudo ./install.sh --yes`, and verify all of the following:
   - no heartbeat is sent at once
   - `systemctl list-timers hostwatch-heartbeat.timer` shows NEXT about 5 min away
   - no warning is printed
 
   Reboot and verify that, without touching any unit, NEXT is set right after boot, the first heartbeat arrives about 5 minutes after boot, and the next ones about every 5 minutes. Repeat with `interval_minutes = 60` (first heartbeat about 60 min after boot). The request asked for a 3-minute run, but the allowed minimum is 5.
-- [ ] 5.3 On a host with a real config, run `sha256sum /etc/hostwatch/config.ini`, then `sudo ./install.sh` and press Enter. Verify that the summary shows the masked webhook, machine name and heartbeat, that no other configuration question is asked, and that the checksum, owner `root:root` and mode `600` are unchanged. Repeat with `sudo ./install.sh --yes` and from a script without a terminal (`sudo ./install.sh < /dev/null`), and verify that neither asks anything and the checksum is unchanged.
-- [ ] 5.4 Run `sudo ./install.sh`, answer `n` and enter a new webhook. Verify that `config.ini.bak` holds the previous content (compare it with the checksum from 5.3) with `root:root 600`, and that the new webhook is in `config.ini` with every other setting unchanged. Repeat with `n` and an empty answer, and verify that nothing changes and no new backup is written.
-- [ ] 5.5 On a fresh host (or after `sudo ./uninstall.sh --purge`), run `sudo ./install.sh`. Verify that it asks for the webhook and then the machine name, that `https://example.com/x` is refused, and that a valid webhook and `Maja PC` end up in the config.
-- [ ] 5.6 Use a config without a `[heartbeat]` section and run the installer. Verify that it lists the missing settings with their defaults and does not change the file.
-- [ ] 5.7 After tasks 5.3–5.5, check the captured installer output and `journalctl --since "<start of test>"`. Verify that `grep` for the webhook's path segments finds nothing in either.
+- [x] 5.3 On a host with a real config, run `sha256sum /etc/hostwatch/config.ini`, then `sudo ./install.sh` and press Enter. Verify that the summary shows the masked webhook, machine name and heartbeat, that no other configuration question is asked, and that the checksum, owner `root:root` and mode `600` are unchanged. Repeat with `sudo ./install.sh --yes` and from a script without a terminal (`sudo ./install.sh < /dev/null`), and verify that neither asks anything and the checksum is unchanged.
+- [x] 5.4 Run `sudo ./install.sh`, answer `n` and enter a new webhook. Verify that `config.ini.bak` holds the previous content (compare it with the checksum from 5.3) with `root:root 600`, and that the new webhook is in `config.ini` with every other setting unchanged. Repeat with `n` and an empty answer, and verify that nothing changes and no new backup is written.
+- [x] 5.5 On a fresh host (or after `sudo ./uninstall.sh --purge`), run `sudo ./install.sh`. Verify that it asks for the webhook and then the machine name, that `https://example.com/x` is refused, and that a valid webhook and `Maja PC` end up in the config.
+- [x] 5.6 Use a config without a `[heartbeat]` section and run the installer. Verify that it lists the missing settings with their defaults and does not change the file.
+- [x] 5.7 After tasks 5.3–5.5, check the captured installer output and `journalctl --since "<start of test>"`. Verify that `grep` for the webhook's path segments finds nothing in either.
 
 ## Workflow follow-up
 
