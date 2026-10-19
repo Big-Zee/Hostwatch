@@ -5,7 +5,7 @@ import os
 import signal
 import sys
 
-from . import config, log, messages, netinfo, processes, sessions, slack, state, timefmt
+from . import config, log, messages, netinfo, processes, sessions, slack, state, timefmt, uptime
 
 LOGIN_DEADLINE = 60  # seconds the detached login sender may live
 
@@ -59,6 +59,36 @@ def _load_config(args, event, default_path=None):
         return None
 
 
+def _uptime_settings(cfg, event):
+    """(daily_summary_enabled, last_alive_interval_minutes, retention_days).
+
+    An invalid [uptime] setting is logged and only turns off the daily
+    summary field for this run; the ledger itself keeps working with the
+    documented defaults, the same "a typo cannot silence a notification"
+    policy as [heartbeat] and [login].
+    """
+    try:
+        return config.uptime_settings(cfg)
+    except config.ConfigError as exc:
+        log.error(f"{event}: {exc}; uptime-today will not be shown this run")
+        return False, config.DEFAULT_LAST_ALIVE_INTERVAL, config.DEFAULT_RETENTION_DAYS
+
+
+def _uptime_today_text(compute, event):
+    """Run ``compute`` (a zero-arg callable touching the uptime ledger) and
+    return its result, or None.
+
+    A bug here (anything beyond the failures uptime.py already turns into a
+    sentinel) must not cost the notification itself: only the uptime-today
+    field is lost, logged the same way any other unexpected error is.
+    """
+    try:
+        return compute()
+    except Exception as exc:
+        _log_unexpected(event, exc)
+        return None
+
+
 def _log_unexpected(event, exc):
     """Log an unexpected error by type and location only.
 
@@ -92,15 +122,36 @@ def run_boot(args):
         cfg = _load_config(args, "boot")
         if cfg is None:
             return 0
+        daily_summary, _interval, retention_days = _uptime_settings(cfg, "boot")
         time_str = timefmt.format_time(timefmt.now(), cfg.timezone)
         boot_time = timefmt.kernel_boot_time()
         boot_str = timefmt.format_time(boot_time, cfg.timezone) if boot_time else None
+
+        def _ledger_work():
+            # Close the previous session before computing "uptime today
+            # before this boot", so a crashed session already counts.
+            if not dry_run and not clean:
+                uptime.close_open_entry(uptime.read_last_alive(), "unclean", retention_days,
+                                        estimated=True, now=timefmt.now())
+            before_str = None
+            if daily_summary:
+                entries, _status = uptime.load_ledger()
+                before = uptime.today_uptime(entries, None, timefmt.now())
+                if before.sessions:
+                    before_str = uptime.format_uptime_today(
+                        before.seconds, before.sessions, before.estimated)
+            if not dry_run:
+                uptime.record_boot(boot_time or timefmt.now(), retention_days)
+            return before_str
+
+        uptime_before_str = _uptime_today_text(_ledger_work, "boot")
 
         def build():
             # Rebuilt on each attempt: addresses may appear only after the first try.
             machine, ips, users = _identity(cfg)
             return messages.boot_message(machine, time_str, boot_str, ips, users,
-                                         unclean_previous=not clean)
+                                         unclean_previous=not clean,
+                                         uptime_today_before_str=uptime_before_str)
 
         _deliver(args, cfg, build, slack.BOOT_DELAYS, "boot")
     except Exception as exc:  # a failed unit would mark boot "degraded"
@@ -136,23 +187,58 @@ def run_heartbeat(args):
         if not enabled:
             log.info("heartbeat: disabled in config, skipping")
             return 0
-        if not getattr(args, "dry_run", False) and netinfo.timer_recently_started(
+        dry_run = getattr(args, "dry_run", False)
+        if not dry_run and netinfo.timer_recently_started(
                 HEARTBEAT_TIMER_UNIT, HEARTBEAT_START_GRACE):
             log.info("heartbeat: timer just (re)started, skipping this run")
             return 0
-        uptime = timefmt.uptime_seconds()
+        daily_summary, _interval, _retention_days = _uptime_settings(cfg, "heartbeat")
+        session_uptime = timefmt.uptime_seconds()
         boot_time = timefmt.kernel_boot_time()
         top = processes.top_processes()  # samples for ~1 s
         machine, ips, users = _identity(cfg, include_ipv6=False)
+
+        def _ledger_work():
+            if not dry_run:
+                uptime.touch_last_alive(timefmt.now())
+            if daily_summary and boot_time is not None:
+                entries, _status = uptime.load_ledger()
+                today = uptime.today_uptime(entries, boot_time, timefmt.now())
+                if today.sessions:
+                    return uptime.format_uptime_today(
+                        today.seconds, today.sessions, today.estimated)
+            return None
+
+        uptime_today_str = _uptime_today_text(_ledger_work, "heartbeat")
+
         payload = messages.heartbeat_message(
             machine,
-            timefmt.format_uptime(uptime) if uptime is not None else None,
+            timefmt.format_uptime(session_uptime) if session_uptime is not None else None,
             timefmt.format_time(boot_time, cfg.timezone, seconds=False) if boot_time else None,
             ips, users, processes.format_table(top),
+            uptime_today_str=uptime_today_str,
         )
         _deliver(args, cfg, payload, (), "heartbeat", timeout=slack.HEARTBEAT_TIMEOUT)
     except Exception as exc:  # a bug must not fail the unit; the next tick tries again
         _log_unexpected("heartbeat", exc)
+    return 0
+
+
+def run_last_alive(args):
+    """hostwatch-last-alive.service (started by its timer, and each heartbeat):
+
+    refresh the last-alive timestamp so an unclean shutdown can later be
+    closed with a good estimate instead of none at all.
+    """
+    try:
+        cfg = config.load(getattr(args, "config", None), require_webhook=False)
+    except config.ConfigError as exc:
+        log.error(f"last-alive: {exc}")
+        return 0
+    try:
+        uptime.touch_last_alive(timefmt.now())
+    except Exception as exc:  # a bug here must not fail the unit
+        _log_unexpected("last-alive", exc)
     return 0
 
 
@@ -164,6 +250,23 @@ def run_heartbeat_interval(args):
     try:
         cfg = config.load(getattr(args, "config", None), require_webhook=False)
         print(config.heartbeat_settings(cfg)[1])
+    except config.ConfigError as exc:
+        log.error(str(exc))
+        return 1
+    return 0
+
+
+def run_uptime_interval(args):
+    """Admin helper for install.sh: print the validated last-alive interval in minutes.
+
+    Validates every [uptime] setting, so a bad retention_days or
+    daily_summary_enabled also stops install.sh here, before any timer is
+    touched. The webhook is not required: install.sh may run before it is
+    configured.
+    """
+    try:
+        cfg = config.load(getattr(args, "config", None), require_webhook=False)
+        print(config.uptime_settings(cfg)[1])
     except config.ConfigError as exc:
         log.error(str(exc))
         return 1
@@ -217,12 +320,37 @@ def run_shutdown(args):
         cfg = _load_config(args, "shutdown")
         if cfg is None:
             return 0
+        daily_summary, _interval, retention_days = _uptime_settings(cfg, "shutdown")
         event = netinfo.shutdown_kind()
-        uptime = timefmt.uptime_seconds()
+        session_uptime = timefmt.uptime_seconds()
         machine, ips, users = _identity(cfg)
+
+        def _ledger_work():
+            reason = "reboot" if event == "Rebooting" else "clean"
+            if dry_run:
+                # Preview only: show what the field would be without closing
+                # the ledger, same as the boot and heartbeat dry runs.
+                entries, _status = uptime.load_ledger()
+                current_session_start = timefmt.kernel_boot_time()
+            else:
+                closed = uptime.close_open_entry(timefmt.now(), reason, retention_days)
+                if not closed:
+                    return None
+                entries, _status = uptime.load_ledger()
+                current_session_start = None  # already represented as a closed entry above
+            if not daily_summary:
+                return None
+            today = uptime.today_uptime(entries, current_session_start, timefmt.now())
+            if today.sessions:
+                return uptime.format_uptime_today(today.seconds, today.sessions, today.estimated)
+            return None
+
+        uptime_today_str = _uptime_today_text(_ledger_work, "shutdown")
+
         payload = messages.shutdown_message(
             machine, event, timefmt.format_time(timefmt.now(), cfg.timezone), ips, users,
-            timefmt.format_uptime(uptime) if uptime is not None else None,
+            timefmt.format_uptime(session_uptime) if session_uptime is not None else None,
+            uptime_today_str=uptime_today_str,
         )
         _deliver(args, cfg, payload, (), "shutdown", timeout=slack.SHUTDOWN_TIMEOUT)
     except Exception as exc:  # never let a bug fail the stop job
@@ -345,6 +473,8 @@ def build_parser():
     sub.add_parser("login", parents=[common], help="send a login notification (pam_exec hook)")
     sub.add_parser("test", parents=[common], help="send a test message; exit 1 if it fails")
     sub.add_parser("heartbeat-interval", parents=[common])  # hidden: used by install.sh
+    sub.add_parser("uptime-interval", parents=[common])  # hidden: used by install.sh
+    sub.add_parser("last-alive", parents=[common])  # hidden: used by its own timer
     summary = sub.add_parser("config-summary", parents=[common])  # hidden: used by install.sh
     summary.add_argument("--example", required=True)
     return parser
@@ -353,7 +483,8 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     handlers = {"boot": run_boot, "shutdown": run_shutdown, "heartbeat": run_heartbeat,
-                "heartbeat-interval": run_heartbeat_interval,
+                "heartbeat-interval": run_heartbeat_interval, "last-alive": run_last_alive,
+                "uptime-interval": run_uptime_interval,
                 "config-summary": run_config_summary, "login": run_login,
                 "test": run_test}
     return handlers[args.command](args)

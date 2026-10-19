@@ -80,11 +80,14 @@ def build(machine, event, fields, summary, local_ips, users, notice=None, sectio
     return {"text": _escape(f"{machine}{SEPARATOR}{summary}"), "blocks": blocks}
 
 
-def boot_message(machine, time_str, boot_time_str, local_ips, users, unclean_previous=False):
+def boot_message(machine, time_str, boot_time_str, local_ips, users, unclean_previous=False,
+                 uptime_today_before_str=None):
     fields = [
         ("Time", _escape(time_str)),
         ("Kernel boot", _escape(boot_time_str) if boot_time_str else "_unknown_"),
     ]
+    if uptime_today_before_str:
+        fields.append(("Uptime today before this boot", _escape(uptime_today_before_str)))
     summary = f"Booted at {time_str}"
     notice = None
     if unclean_previous:
@@ -93,12 +96,15 @@ def boot_message(machine, time_str, boot_time_str, local_ips, users, unclean_pre
     return build(machine, "Boot", fields, summary, local_ips, users, notice)
 
 
-def shutdown_message(machine, event, time_str, local_ips, users, uptime_str):
+def shutdown_message(machine, event, time_str, local_ips, users, uptime_str,
+                     uptime_today_str=None):
     """``event`` is "Shutting down" or "Rebooting"."""
     fields = [
         ("Time", _escape(time_str)),
         ("Uptime", _escape(uptime_str) if uptime_str else "_unknown_"),
     ]
+    if uptime_today_str:
+        fields.append(("Uptime today", _escape(uptime_today_str)))
     summary = f"{event} at {time_str}"
     if uptime_str:
         summary += f" ({uptime_str})"
@@ -122,12 +128,15 @@ def login_message(machine, user, login_type, time_str, local_ips, users, tty=Non
     return build(machine, f"Login: {user}", fields, summary, local_ips, users)
 
 
-def heartbeat_message(machine, uptime_str, since_str, local_ips, users, top_table):
+def heartbeat_message(machine, uptime_str, since_str, local_ips, users, top_table,
+                      uptime_today_str=None):
     """``top_table`` is the code block from processes.format_table()."""
     fields = [
         ("Uptime", _escape(uptime_str) if uptime_str else "_unknown_"),
         ("Since", _escape(since_str) if since_str else "_unknown_"),
     ]
+    if uptime_today_str:
+        fields.append(("Uptime today", _escape(uptime_today_str)))
     summary = "Alive"
     if uptime_str:
         summary += f", {uptime_str}"

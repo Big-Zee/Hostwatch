@@ -107,6 +107,16 @@ class EventFieldsTest(unittest.TestCase):
         self.assertEqual(warned["text"],
                          f"my-pc · Booted at {T} – previous shutdown was not clean")
 
+    def test_boot_uptime_today_before(self):
+        p = messages.boot_message("my-pc", T, T, IPS, [],
+                                  uptime_today_before_str="2 h 0 min (1 session)")
+        self.assertEqual(list(fields(p)),
+                         ["Time", "Kernel boot", "Uptime today before this boot",
+                          "Local IP", "Users"])
+        self.assertEqual(fields(p)["Uptime today before this boot"], "2 h 0 min (1 session)")
+        without = messages.boot_message("my-pc", T, T, IPS, [])
+        self.assertNotIn("Uptime today before this boot", fields(without))
+
     def test_shutdown_fields(self):
         p = messages.shutdown_message("my-pc", "Shutting down", T, IPS, USERS, "up 5 h 12 min")
         self.assertEqual(list(fields(p)), ["Time", "Uptime", "Local IP", "Users"])
@@ -114,6 +124,14 @@ class EventFieldsTest(unittest.TestCase):
         unknown = messages.shutdown_message("my-pc", "Shutting down", T, [], [], None)
         self.assertEqual(fields(unknown)["Uptime"], "_unknown_")
         self.assertEqual(unknown["text"], f"my-pc · Shutting down at {T}")
+
+    def test_shutdown_uptime_today(self):
+        p = messages.shutdown_message("my-pc", "Shutting down", T, IPS, USERS, "up 5 h 12 min",
+                                      uptime_today_str="5 h 42 min (2 sessions)")
+        self.assertEqual(list(fields(p)), ["Time", "Uptime", "Uptime today", "Local IP", "Users"])
+        self.assertEqual(fields(p)["Uptime today"], "5 h 42 min (2 sessions)")
+        without = messages.shutdown_message("my-pc", "Shutting down", T, IPS, USERS, "up 5 h 12 min")
+        self.assertNotIn("Uptime today", fields(without))
 
     def test_login_fields(self):
         ssh = messages.login_message("my-pc", "alice", "SSH", T, IPS, USERS, tty="ssh",
@@ -158,6 +176,13 @@ class HeartbeatMessageTest(unittest.TestCase):
         p = self.build(uptime_str=None, since_str=None)
         self.assertEqual(fields(p)["Uptime"], "_unknown_")
         self.assertEqual(p["text"], "office-pc · Alive")
+
+    def test_uptime_today(self):
+        p = self.build(uptime_today_str="5 h 42 min (2 sessions)")
+        self.assertEqual(list(fields(p)), ["Uptime", "Since", "Uptime today", "Local IP", "Users"])
+        self.assertEqual(fields(p)["Uptime today"], "5 h 42 min (2 sessions)")
+        without = self.build()
+        self.assertNotIn("Uptime today", fields(without))
 
     def test_other_types_have_no_extra_section(self):
         p = messages.test_message("office-pc", T, IPS, USERS)

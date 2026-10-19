@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodic HostWatch last-alive timestamp
+Documentation=https://github.com/Big-Zee/Hostwatch
+
+[Timer]
+# Relative to when this timer starts (early in boot, or when install.sh
+# restarts it), not the wall clock, for the same reason as the heartbeat
+# timer. install.sh overrides both values with [uptime]
+# last_alive_interval_minutes in a drop-in (hostwatch-last-alive.timer.d/).
+OnActiveSec=5min
+OnUnitActiveSec=5min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

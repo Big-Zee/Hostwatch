@@ -11,9 +11,13 @@ SHUTDOWN_UNIT=/etc/systemd/system/hostwatch-shutdown.service
 HEARTBEAT_SERVICE=/etc/systemd/system/hostwatch-heartbeat.service
 HEARTBEAT_TIMER=/etc/systemd/system/hostwatch-heartbeat.timer
 HEARTBEAT_DROPIN_DIR=/etc/systemd/system/hostwatch-heartbeat.timer.d
+LAST_ALIVE_SERVICE=/etc/systemd/system/hostwatch-last-alive.service
+LAST_ALIVE_TIMER=/etc/systemd/system/hostwatch-last-alive.timer
+LAST_ALIVE_DROPIN_DIR=/etc/systemd/system/hostwatch-last-alive.timer.d
 PAM_PROFILE=/usr/share/pam-configs/hostwatch
 CONF_DIR=/etc/hostwatch
 STATE_DIR=/var/lib/hostwatch
+LEDGER=uptime.json
 PAM_SESSION=/etc/pam.d/common-session
 PAM_HOOK_RE='pam_exec\.so.*/usr/local/bin/hostwatch login'
 
@@ -59,24 +63,53 @@ echo "Removing heartbeat"
 systemctl disable --now hostwatch-heartbeat.timer || true
 systemctl stop hostwatch-heartbeat.service || true
 
+echo "Removing last-alive timer"
+systemctl disable --now hostwatch-last-alive.timer || true
+systemctl stop hostwatch-last-alive.service || true
+
 echo "Removing boot notification"
 # --now: a boot notification that is still retrying must not send afterwards.
 systemctl disable --now hostwatch-boot.service || true
 
-rm -f "$UNIT" "$SHUTDOWN_UNIT" "$HEARTBEAT_TIMER" "$HEARTBEAT_SERVICE"
-rm -rf "$HEARTBEAT_DROPIN_DIR"
+rm -f "$UNIT" "$SHUTDOWN_UNIT" "$HEARTBEAT_TIMER" "$HEARTBEAT_SERVICE" \
+    "$LAST_ALIVE_TIMER" "$LAST_ALIVE_SERVICE"
+rm -rf "$HEARTBEAT_DROPIN_DIR" "$LAST_ALIVE_DROPIN_DIR"
 rm -f /etc/systemd/system/multi-user.target.wants/hostwatch-boot.service \
     /etc/systemd/system/multi-user.target.wants/hostwatch-shutdown.service \
-    /etc/systemd/system/timers.target.wants/hostwatch-heartbeat.timer
+    /etc/systemd/system/timers.target.wants/hostwatch-heartbeat.timer \
+    /etc/systemd/system/timers.target.wants/hostwatch-last-alive.timer
 systemctl daemon-reload
 for unit in hostwatch-boot.service hostwatch-shutdown.service \
-        hostwatch-heartbeat.service hostwatch-heartbeat.timer; do
+        hostwatch-heartbeat.service hostwatch-heartbeat.timer \
+        hostwatch-last-alive.service hostwatch-last-alive.timer; do
     systemctl reset-failed "$unit" 2>/dev/null || true
 done
 
 echo "Removing program files"
 rm -f "$BIN"
-rm -rf "$LIB_DIR" "$STATE_DIR"
+# The boot-session ledger is the admin's usage history, not an installed
+# program file: ask before it goes, defaulting to "keep" when there is no
+# terminal to ask on (a non-interactive run, e.g. from a script).
+keep_ledger=0
+if [[ -e "$STATE_DIR/$LEDGER" ]]; then
+    if [[ -t 0 ]]; then
+        read -r -p "Delete the boot-session uptime history ($STATE_DIR/$LEDGER)? [y/N] " answer \
+            || answer=""
+        case "$answer" in
+            y|Y|yes|Yes|YES) keep_ledger=0 ;;
+            *) keep_ledger=1 ;;
+        esac
+    else
+        keep_ledger=1
+    fi
+fi
+rm -rf "$LIB_DIR"
+if [[ $keep_ledger -eq 1 ]]; then
+    find "$STATE_DIR" -mindepth 1 ! -name "$LEDGER" -exec rm -rf {} + 2>/dev/null || true
+    echo "Kept $STATE_DIR/$LEDGER (remove it by hand if you no longer want it)"
+else
+    rm -rf "$STATE_DIR"
+fi
 
 if [[ $purge -eq 1 ]]; then
     echo "Removing $CONF_DIR"

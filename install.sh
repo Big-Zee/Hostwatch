@@ -62,6 +62,9 @@ SHUTDOWN_UNIT=/etc/systemd/system/hostwatch-shutdown.service
 HEARTBEAT_SERVICE=/etc/systemd/system/hostwatch-heartbeat.service
 HEARTBEAT_TIMER=/etc/systemd/system/hostwatch-heartbeat.timer
 HEARTBEAT_DROPIN=/etc/systemd/system/hostwatch-heartbeat.timer.d/interval.conf
+LAST_ALIVE_SERVICE=/etc/systemd/system/hostwatch-last-alive.service
+LAST_ALIVE_TIMER=/etc/systemd/system/hostwatch-last-alive.timer
+LAST_ALIVE_DROPIN=/etc/systemd/system/hostwatch-last-alive.timer.d/interval.conf
 PAM_PROFILE=/usr/share/pam-configs/hostwatch
 CONF_DIR=/etc/hostwatch
 CONF="$CONF_DIR/config.ini"
@@ -123,6 +126,58 @@ conf_tmp() {
 commit_conf() {
     install -m 600 -o root -g root "$1" "$CONF"
     rm -f "$1"
+}
+
+# Apply an interval in minutes to a timer through a drop-in, so the unit
+# file itself stays an unmodified copy from the repository, then enable it
+# and verify it has a next run. An empty assignment to any timer option
+# resets ALL timers (systemd.timer(5)), so there is exactly one reset,
+# first: a second one would also clear the values set before it.
+# OnActiveSec counts from when the timer starts (early in boot, or the
+# restart below), so a schedule exists at every boot and a long-running
+# host does not fire at once after install.
+apply_timer_interval() {
+    local timer="$1" dropin="$2" interval="$3" label="$4"
+    local dropin_content changed=0
+    dropin_content="[Timer]
+OnBootSec=
+OnActiveSec=${interval}min
+OnUnitActiveSec=${interval}min"
+    if [[ ! -e "$dropin" || "$(cat "$dropin")" != "$dropin_content" ]]; then
+        install -d -m 755 "$(dirname "$dropin")"
+        printf '%s\n' "$dropin_content" > "$dropin"
+        chmod 644 "$dropin"
+        changed=1
+        # The drop-in just changed on disk: systemd must re-read it before
+        # the restart below, or the timer restarts with the stale interval
+        # it already had cached in memory.
+        systemctl daemon-reload
+    fi
+    echo "Enabling $label every ${interval} min"
+    systemctl enable "$timer"
+    if [[ $changed -eq 1 ]]; then
+        # Apply the new interval: the next run comes one interval from now.
+        systemctl restart "$timer"
+    else
+        # No-op when already active, so an unchanged re-run sends nothing.
+        systemctl start "$timer"
+    fi
+    # A timer can be active yet never fire (see the drop-in note above):
+    # check that systemd has a monotonic trigger and a next run for it.
+    local timers next
+    timers="$(systemctl show "$timer" -p TimersMonotonic --value)"
+    next="$(systemctl show "$timer" -p NextElapseUSecMonotonic --value)"
+    systemctl list-timers "$timer" --no-pager || true
+    if [[ ! "$timers" =~ On(Unit)?ActiveUSec ]] || [[ -z "$next" || "$next" == 0 || "$next" == infinity ]]; then
+        cat >&2 <<EOF
+install.sh: WARNING: $timer has no next run, so $label will not fire. Inspect
+it with:
+
+    systemctl list-timers $timer
+    systemctl show $timer -p TimersMonotonic -p NextElapseUSecMonotonic
+
+EOF
+    fi
 }
 
 set_webhook() {
@@ -206,6 +261,8 @@ install -m 644 "$SRC_DIR/systemd/hostwatch-boot.service" "$UNIT"
 install -m 644 "$SRC_DIR/systemd/hostwatch-shutdown.service" "$SHUTDOWN_UNIT"
 install -m 644 "$SRC_DIR/systemd/hostwatch-heartbeat.service" "$HEARTBEAT_SERVICE"
 install -m 644 "$SRC_DIR/systemd/hostwatch-heartbeat.timer" "$HEARTBEAT_TIMER"
+install -m 644 "$SRC_DIR/systemd/hostwatch-last-alive.service" "$LAST_ALIVE_SERVICE"
+install -m 644 "$SRC_DIR/systemd/hostwatch-last-alive.timer" "$LAST_ALIVE_TIMER"
 install -m 644 "$SRC_DIR/pam/hostwatch" "$PAM_PROFILE"
 
 # First install only: record a clean state so the first boot after install
@@ -313,27 +370,15 @@ if grep -q "REPLACE/WITH/YOUR-WEBHOOK" "$CONF"; then
     echo "NOTE: set webhook_url in $CONF before notifications can be sent." >&2
 fi
 
-# Apply [heartbeat] interval_minutes to the timer through a drop-in, so the
-# unit file itself stays an unmodified copy from the repository.
+# Validate [heartbeat] interval_minutes and [uptime] settings before
+# touching any timer or unit.
 if ! interval="$("$BIN" heartbeat-interval --config "$CONF")"; then
     echo "install.sh: fix [heartbeat] interval_minutes in $CONF and run install.sh again" >&2
     exit 1
 fi
-# An empty assignment to any timer option resets ALL timers (systemd.timer(5)),
-# so there is exactly one reset, first: a second one would also clear the
-# values set before it. OnActiveSec counts from when the timer starts (early
-# in boot, or the restart below), so a schedule exists at every boot and a
-# long-running host does not fire at once after install.
-dropin_content="[Timer]
-OnBootSec=
-OnActiveSec=${interval}min
-OnUnitActiveSec=${interval}min"
-interval_changed=0
-if [[ ! -e "$HEARTBEAT_DROPIN" || "$(cat "$HEARTBEAT_DROPIN")" != "$dropin_content" ]]; then
-    install -d -m 755 "$(dirname "$HEARTBEAT_DROPIN")"
-    printf '%s\n' "$dropin_content" > "$HEARTBEAT_DROPIN"
-    chmod 644 "$HEARTBEAT_DROPIN"
-    interval_changed=1
+if ! last_alive_interval="$("$BIN" uptime-interval --config "$CONF")"; then
+    echo "install.sh: fix [uptime] settings in $CONF and run install.sh again" >&2
+    exit 1
 fi
 
 echo "Enabling boot notification"
@@ -346,30 +391,9 @@ echo "Enabling shutdown notification"
 # active unit, so re-running install.sh sends nothing.
 systemctl enable --now hostwatch-shutdown.service
 
-echo "Enabling heartbeat every ${interval} min"
-systemctl enable hostwatch-heartbeat.timer
-if [[ $interval_changed -eq 1 ]]; then
-    # Apply the new interval: the next heartbeat comes one interval from now.
-    systemctl restart hostwatch-heartbeat.timer
-else
-    # No-op when already active, so an unchanged re-run sends nothing.
-    systemctl start hostwatch-heartbeat.timer
-fi
-# A timer can be active yet never fire (see the drop-in note above): check
-# that systemd has a monotonic trigger and a next run for it.
-timers="$(systemctl show hostwatch-heartbeat.timer -p TimersMonotonic --value)"
-next="$(systemctl show hostwatch-heartbeat.timer -p NextElapseUSecMonotonic --value)"
-systemctl list-timers hostwatch-heartbeat.timer --no-pager || true
-if [[ ! "$timers" =~ On(Unit)?ActiveUSec ]] || [[ -z "$next" || "$next" == 0 || "$next" == infinity ]]; then
-    cat >&2 <<'EOF'
-install.sh: WARNING: hostwatch-heartbeat.timer has no next run, so no heartbeats
-will be sent. Inspect it with:
-
-    systemctl list-timers hostwatch-heartbeat.timer
-    systemctl show hostwatch-heartbeat.timer -p TimersMonotonic -p NextElapseUSecMonotonic
-
-EOF
-fi
+apply_timer_interval "hostwatch-heartbeat.timer" "$HEARTBEAT_DROPIN" "$interval" "heartbeat"
+apply_timer_interval "hostwatch-last-alive.timer" "$LAST_ALIVE_DROPIN" "$last_alive_interval" \
+    "the last-alive timer"
 
 echo "Enabling login hook"
 pam-auth-update --package --enable hostwatch
